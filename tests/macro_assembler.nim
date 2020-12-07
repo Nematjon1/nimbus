@@ -1,15 +1,15 @@
 import
-  macros, macrocache, strutils, unittest,
-  byteutils, chronicles, ranges, eth/common,
+  macrocache, strutils, unittest2,
+  stew/byteutils, chronicles, eth/common,
   ../nimbus/vm/interpreter/opcode_values,
-  std_shims/macros_shim
+  stew/shims/macros, ../nimbus/config
 
 import
   options, json, os, eth/trie/[db, hexary],
-  ../nimbus/[vm_state, tracer, vm_types, transaction, utils],
-  ../nimbus/db/[db_chain, state_db],
+  ../nimbus/[vm_state, vm_types, transaction, utils],
+  ../nimbus/db/[db_chain, accounts_cache],
   ../nimbus/vm_state_transactions,
-  ../nimbus/vm/interpreter/[vm_forks, gas_costs],
+  ../nimbus/vm/interpreter/vm_forks,
   ../nimbus/vm/[message, computation, memory]
 
 export opcode_values, byteutils
@@ -172,6 +172,10 @@ proc parseFork(fork: NimNode): Fork =
   fork[0].expectKind({nnkIdent, nnkStrLit})
   parseEnum[Fork](strip(fork[0].strVal))
 
+proc parseGasUsed(gas: NimNode): GasInt =
+  gas[0].expectKind(nnkIntLit)
+  result = gas[0].intVal
+
 proc generateVMProxy(boa: Assembler): NimNode =
   let
     vmProxy = genSym(nskProc, "vmProxy")
@@ -185,7 +189,8 @@ proc generateVMProxy(boa: Assembler): NimNode =
       proc `vmProxy`(): bool =
         let boa = `body`
         runVM(`blockNumber`, `chainDB`, boa)
-      check `vmProxy`()
+      {.gcsafe.}:
+        check `vmProxy`()
 
   when defined(macro_assembler_debug):
     echo result.toStrLit.strVal
@@ -193,23 +198,39 @@ proc generateVMProxy(boa: Assembler): NimNode =
 const
   blockFile = "tests" / "fixtures" / "PersistBlockTests" / "block47205.json"
 
-proc initComputation(vmState: BaseVMState, tx: Transaction, sender: EthAddress, data: seq[byte], forkOverride=none(Fork)) : BaseComputation =
+proc initComputation(vmState: BaseVMState, tx: Transaction, sender: EthAddress, data: seq[byte], forkOverride=none(Fork)) : Computation =
   doAssert tx.isContractCreation
 
   let fork =
     if forkOverride.isSome:
       forkOverride.get
     else:
-      vmState.blockNumber.toFork
+      vmState.chainDB.config.toFork(vmState.blockNumber)
 
   let gasUsed = 0 #tx.payload.intrinsicGas.GasInt + gasFees[fork][GasTXCreate]
 
-  let contractAddress = generateAddress(sender, tx.accountNonce)
-  let msg = newMessage(tx.gasLimit - gasUsed, tx.gasPrice, tx.to, sender, tx.value, data, tx.payload,
-                       contractCreation = false,
-                       options = newMessageOptions(origin = sender, createAddress = contractAddress))
+  vmState.setupTxContext(
+    origin = sender,
+    gasPrice = tx.gasPrice,
+    forkOverride = some(fork)
+  )
 
-  newBaseComputation(vmState, vmState.blockNumber, msg, some(fork))
+  let contractAddress = generateAddress(sender, tx.accountNonce)
+  let msg = Message(
+      kind: evmcCall,
+      depth: 0,
+      gas: tx.gasLimit - gasUsed,
+      sender: sender,
+      contractAddress: contractAddress,
+      codeAddress: contractAddress,
+      value: tx.value,
+      data: data
+      )
+
+  vmState.mutateStateDb:
+    db.setCode(contractAddress, tx.payload)
+
+  newComputation(vmState, msg)
 
 proc initDatabase*(): (Uint256, BaseChainDB) =
   let
@@ -225,7 +246,7 @@ proc initDatabase*(): (Uint256, BaseChainDB) =
 
   result = (blockNumber, newBaseChainDB(memoryDB, false))
 
-proc initComputation(blockNumber: Uint256, chainDB: BaseChainDB, payload, data: seq[byte], fork: Fork): BaseComputation =
+proc initComputation(blockNumber: Uint256, chainDB: BaseChainDB, code, data: seq[byte], fork: Fork): Computation =
   let
     parentNumber = blockNumber - 1
     parent = chainDB.getBlockHeader(parentNumber)
@@ -238,7 +259,7 @@ proc initComputation(blockNumber: Uint256, chainDB: BaseChainDB, payload, data: 
     tx = body.transactions[0]
     sender = transaction.getSender(tx)
 
-  tx.payload = payload
+  tx.payload = code
   tx.gasLimit = 500000000
   initComputation(vmState, tx, sender, data, some(fork))
 
@@ -256,6 +277,11 @@ proc runVM*(blockNumber: Uint256, chainDB: BaseChainDB, boa: Assembler): bool =
   else:
     if boa.success == true:
       error "different success value", expected=boa.success, actual=false
+      return false
+
+  if boa.gasUsed != -1:
+    if boa.gasUsed != gasUsed:
+      error "different gasUsed", expected=boa.gasUsed, actual=gasUsed
       return false
 
   if boa.stack.len != computation.stack.values.len:
@@ -283,16 +309,18 @@ proc runVM*(blockNumber: Uint256, chainDB: BaseChainDB, boa: Assembler): bool =
       error "different memory value", idx=i, expected=mem, actual=actual
       return false
 
+  var stateDB = computation.vmState.accountDb
+  stateDB.persist()
+
   var
-    stateDB = computation.vmState.accountDb
-    account = stateDB.getAccount(computation.msg.storageAddress)
-    trie = initSecureHexaryTrie(chainDB.db, account.storageRoot)
+    storageRoot = stateDB.getStorageRoot(computation.msg.contractAddress)
+    trie = initSecureHexaryTrie(chainDB.db, storageRoot)
 
   for kv in boa.storage:
     let key = kv[0].toHex()
     let val = kv[1].toHex()
-    let keyBytes = (@(kv[0])).toRange
-    let actual = trie.get(keyBytes).toOpenArray().toHex()
+    let keyBytes = (@(kv[0]))
+    let actual = trie.get(keyBytes).toHex()
     let zerosLen = 64 - (actual.len)
     let value = repeat('0', zerosLen) & actual
     if val != value:
@@ -335,7 +363,7 @@ proc runVM*(blockNumber: Uint256, chainDB: BaseChainDB, boa: Assembler): bool =
   result = true
 
 macro assembler*(list: untyped): untyped =
-  var boa = Assembler(success: true, fork: FkFrontier)
+  var boa = Assembler(success: true, fork: FkFrontier, gasUsed: -1)
   list.expectKind nnkStmtList
   for callSection in list:
     callSection.expectKind(nnkCall)
@@ -355,5 +383,11 @@ macro assembler*(list: untyped): untyped =
     of "data": boa.data = parseData(body)
     of "output": boa.output = parseData(body)
     of "fork": boa.fork = parseFork(body)
+    of "gasused": boa.gasUsed = parseGasUsed(body)
     else: error("unknown section '" & label & "'", callSection[0])
   result = boa.generateVMProxy()
+
+macro evmByteCode*(list: untyped): untyped =
+  list.expectKind nnkStmtList
+  var code = parseCode(list)
+  result = newLitFixed(code)

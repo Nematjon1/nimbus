@@ -6,14 +6,15 @@
 # at your option. This file may not be copied, modified, or distributed except according to those terms.
 
 import
-  unittest, strformat, strutils, tables, json, ospaths, times, os,
-  byteutils, ranges/typedranges, nimcrypto, options,
+  unittest2, strutils, tables, json, times, os, sets,
+  nimcrypto, options,
   eth/[rlp, common], eth/trie/[db, trie_defs], chronicles,
-  ./test_helpers, ../nimbus/p2p/executor, test_config,
-  ../nimbus/[constants, errors, transaction],
-  ../nimbus/[vm_state, vm_types, vm_state_transactions, utils],
+  ./test_helpers, ./test_allowed_to_fail,
+  ../nimbus/p2p/executor, test_config,
+  ../nimbus/transaction,
+  ../nimbus/[vm_state, vm_types, utils],
   ../nimbus/vm/interpreter,
-  ../nimbus/db/[db_chain, state_db]
+  ../nimbus/db/[db_chain, accounts_cache]
 
 type
   Tester = object
@@ -25,6 +26,7 @@ type
     expectedLogs: string
     fork: Fork
     debugMode: bool
+    trace: bool
     index: int
 
   GST_VMState = ref object of BaseVMState
@@ -74,22 +76,30 @@ proc dumpDebugData(tester: Tester, vmState: BaseVMState, sender: EthAddress, gas
       accounts[$account] = dumpAccount(vmState.readOnlyStateDB, account, "pre" & $i)
       inc i
 
+  let tracingResult = if tester.trace: vmState.getTracingResult() else: %[]
   let debugData = %{
     "gasUsed": %gasUsed,
-    "structLogs": vmState.getTracingResult(),
+    "structLogs": tracingResult,
     "accounts": accounts
   }
   let status = if success: "_success" else: "_failed"
   writeFile("debug_" & tester.name & "_" & $tester.index & status & ".json", debugData.pretty())
 
 proc testFixtureIndexes(tester: Tester, testStatusIMPL: var TestStatus) =
-  var tracerFlags: set[TracerFlags] = if tester.debugMode: {TracerFlags.EnableTracing} else : {}
-  var vmState = newGST_VMState(emptyRlpHash, tester.header, newBaseChainDB(newMemoryDb()), tracerFlags)
+  var tracerFlags: set[TracerFlags] = if tester.trace: {TracerFlags.EnableTracing} else : {}
+
+  var chainDB = newBaseChainDB(newMemoryDb(), pruneTrie = getConfiguration().pruning)
+  var vmState = newGST_VMState(emptyRlpHash, tester.header, chainDB, tracerFlags)
   var gasUsed: GasInt
   let sender = tester.tx.getSender()
 
   vmState.mutateStateDB:
     setupStateDB(tester.pre, db)
+
+    # this is an important step when using accounts_cache
+    # it will affect the account storage's location
+    # during the next call to `getComittedStorage`
+    db.persist()
 
   defer:
     let obtainedHash = "0x" & `$`(vmState.readOnlyStateDB.rootHash).toLowerAscii
@@ -102,30 +112,33 @@ proc testFixtureIndexes(tester: Tester, testStatusIMPL: var TestStatus) =
       let success = expectedLogsHash == actualLogsHash and obtainedHash == tester.expectedHash
       tester.dumpDebugData(vmState, sender, gasUsed, success)
 
-  if not validateTransaction(vmState, tester.tx, sender):
-    vmState.mutateStateDB:
-      # pre-EIP158 (e.g., Byzantium) should ensure currentCoinbase exists
-      # in later forks, don't create at all
-      db.addBalance(tester.header.coinbase, 0.u256)
-
-      # TODO: this feels not right to be here
-      # perhaps the entire validateTransaction block
-      # should be moved into processTransaction
-      if tester.fork >= FkSpurious:
-        let recipient = tester.tx.getRecipient()
-        let miner = tester.header.coinbase
-        let touchedAccounts = [miner] # [sender, miner, recipient]
-        for account in touchedAccounts:
-          debug "state clearing", account
-          if db.accountExists(account) and db.isEmptyAccount(account):
-            db.deleteAccount(account)
-
-    return
-
   gasUsed = tester.tx.processTransaction(sender, vmState, tester.fork)
 
+  # This is necessary due to the manner in which the state tests are
+  # generated. State tests are generated from the BlockChainTest tests
+  # in which these transactions are included in the larger context of a
+  # block and thus, the mechanisms which would touch/create/clear the
+  # coinbase account based on the mining reward are present during test
+  # generation, but not part of the execution, thus we must artificially
+  # create the account in VMs prior to the state clearing rules,
+  # as well as conditionally cleaning up the coinbase account when left
+  # empty in VMs after the state clearing rules came into effect.
+  let miner = tester.header.coinbase
+  if miner in vmState.suicides:
+    vmState.mutateStateDB:
+      db.addBalance(miner, 0.u256)
+      if tester.fork >= FkSpurious:
+        if db.isEmptyAccount(miner):
+          db.deleteAccount(miner)
+
+      # this is an important step when using accounts_cache
+      # it will affect the account storage's location
+      # during the next call to `getComittedStorage`
+      # and the result of rootHash
+      db.persist()
+
 proc testFixture(fixtures: JsonNode, testStatusIMPL: var TestStatus,
-                 debugMode = false, supportedForks: set[Fork] = supportedForks) =
+                 trace = false, debugMode = false, supportedForks: set[Fork] = supportedForks) =
   var tester: Tester
   var fixture: JsonNode
   for label, child in fixtures:
@@ -144,11 +157,14 @@ proc testFixture(fixtures: JsonNode, testStatusIMPL: var TestStatus,
     )
 
   let specifyIndex = getConfiguration().index
+  tester.trace = trace
   tester.debugMode = debugMode
   let ftrans = fixture["transaction"]
   var testedInFork = false
+  var numIndex = -1
   for fork in supportedForks:
     if fixture["post"].hasKey(forkNames[fork]):
+      numIndex = fixture["post"][forkNames[fork]].len
       for expectation in fixture["post"][forkNames[fork]]:
         inc tester.index
         if specifyIndex > 0 and tester.index != specifyIndex:
@@ -167,13 +183,22 @@ proc testFixture(fixtures: JsonNode, testStatusIMPL: var TestStatus,
         testFixtureIndexes(tester, testStatusIMPL)
 
   if not testedInFork:
-    echo "test subject '", tester.name, "' not tested in any forks"
+    echo "test subject '", tester.name, "' not tested in any forks/subtests"
+    if specifyIndex <= 0 or specifyIndex > numIndex:
+      echo "Maximum subtest available: ", numIndex
+    else:
+      echo "available forks in this test:"
+      for fork in test_helpers.supportedForks:
+        if fixture["post"].hasKey(forkNames[fork]):
+          echo fork
 
-proc main() =
-  if paramCount() == 0:
+proc generalStateJsonMain*(debugMode = false) =
+  if paramCount() == 0 or not debugMode:
     # run all test fixtures
     suite "generalstate json tests":
-      jsonTest("GeneralStateTests", testFixture)
+      jsonTest("GeneralStateTests", testFixture, skipGSTTests)
+    suite "new generalstate json tests":
+      jsonTest("newGeneralStateTests", testFixture, skipNewGSTTests)
   else:
     # execute single test in debug mode
     let config = getConfiguration()
@@ -181,12 +206,13 @@ proc main() =
       echo "missing test subject"
       quit(QuitFailure)
 
-    let path = "tests" / "fixtures" / "GeneralStateTests"
+    let folder = if config.legacy: "GeneralStateTests" else: "newGeneralStateTests"
+    let path = "tests" / "fixtures" / folder
     let n = json.parseFile(path / config.testSubject)
     var testStatusIMPL: TestStatus
     var forks: set[Fork] = {}
     forks.incl config.fork
-    testFixture(n, testStatusIMPL, true, forks)
+    testFixture(n, testStatusIMPL, config.trace, true, forks)
 
 when isMainModule:
   var message: string
@@ -199,5 +225,4 @@ when isMainModule:
     if len(message) > 0:
       echo message
       quit(QuitSuccess)
-
-  main()
+  generalStateJsonMain(true)

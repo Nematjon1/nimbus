@@ -1,12 +1,11 @@
 import
-  json, downloader, stint, strutils, byteutils, parser, 
+  json, downloader, stint, stew/byteutils, parser,
   chronicles, ../nimbus/[tracer, vm_state, utils], eth/trie/[trie_defs, db],
   ../nimbus/db/[db_chain, state_db], ../nimbus/p2p/executor, premixcore,
   eth/common, configuration, tables, ../nimbus/vm_types, hashes
-  
+
 const
   emptyCodeHash = blankStringHash
-  emptyStorageHash = emptyRlpHash
 
 proc store(memoryDB: TrieDatabaseRef, branch: JsonNode) =
   for p in branch:
@@ -48,7 +47,7 @@ proc prepareBlockEnv(parent: BlockHeader, thisBlock: Block): TrieDatabaseRef =
 
     if acc.codeHash != emptyCodeHash:
       let codeStr = request("eth_getCode", %[%address.prefixHex, parentNumber])
-      let code = hexToSeqByte(codeStr.getStr).toRange
+      let code = hexToSeqByte(codeStr.getStr)
       accountDB.setCode(address, code)
 
     accountDB.setAccount(address, acc)
@@ -106,7 +105,7 @@ proc huntProblematicBlock(blockNumber: Uint256): ValidationResult =
 
   result = validationResult
 
-proc main() =
+proc main() {.used.} =
   let conf = getConfiguration()
 
   if conf.head == 0.u256:

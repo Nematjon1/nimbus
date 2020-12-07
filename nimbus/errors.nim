@@ -6,7 +6,7 @@
 # at your option. This file may not be copied, modified, or distributed except according to those terms.
 
 type
-  EVMError* = object of Exception
+  EVMError* = object of CatchableError
     ## Base error class for all evm errors.
 
   BlockNotFound* = object of EVMError
@@ -23,8 +23,6 @@ type
 
   VMError* = object of EVMError
     ## Class of errors which can be raised during VM execution.
-    erasesReturnData*: bool
-    burnsGas*: bool
 
   OutOfGas* = object of VMError
     ## Error signaling that VM execution has run out of gas.
@@ -67,8 +65,3 @@ type
 
   StaticContextError* = object of VMError
     ## State changes not allowed in static call context
-
-proc makeVMError*: ref VMError =
-  new(result)
-  result.burnsGas = true
-  result.erasesReturnData = true

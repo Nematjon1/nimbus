@@ -28,14 +28,14 @@
 ]#
 
 import
-  stint, byteutils, eth/[keys, rlp], eth/common/eth_types,
+  stint, stew/byteutils, eth/[keys, rlp], eth/common/eth_types,
   eth/p2p/rlpx_protocols/whisper_protocol
 
 type
   HexQuantityStr* = distinct string
   HexDataStr* = distinct string
-  EthAddressStr* = distinct string        # Same as HexDataStr but must be less <= 20 bytes
-  EthHashStr* = distinct string           # Same as HexDataStr but must be exactly 32 bytes
+  EthAddressStr* = distinct string     # Same as HexDataStr but must be less <= 20 bytes
+  EthHashStr* = distinct string        # Same as HexDataStr but must be exactly 32 bytes
   Identifier* = distinct string        # 32 bytes, no 0x prefix!
   HexStrings = HexQuantityStr | HexDataStr | EthAddressStr | EthHashStr |
                Identifier
@@ -51,9 +51,13 @@ template stripLeadingZeros(value: string): string =
     cidx.inc
   value[cidx .. ^1]
 
-func encodeQuantity*(value: SomeUnsignedInt): string {.inline.} =
+func encodeQuantity*(value: SomeUnsignedInt): HexQuantityStr  {.inline.} =
   var hValue = value.toHex.stripLeadingZeros
-  result = "0x" & hValue
+  result = HexQuantityStr("0x" & hValue)
+
+func encodeQuantity*(value: UInt256): HexQuantityStr  {.inline.} =
+  var hValue = value.toHex
+  result = HexQuantityStr("0x" & hValue)
 
 template hasHexHeader(value: string): bool =
   if value.len >= 2 and value[0] == '0' and value[1] in {'x', 'X'}: true
@@ -64,6 +68,15 @@ template isHexChar(c: char): bool =
       c notin {'a'..'f'} and
       c notin {'A'..'F'}: false
   else: true
+
+func `==`*(a, b: HexQuantityStr): bool {.inline.} =
+  a.string == b.string
+
+func `==`*(a, b: EthAddressStr): bool {.inline.} =
+  a.string == b.string
+
+func `==`*(a, b: HexDataStr): bool {.inline.} =
+  a.string == b.string
 
 func isValidHexQuantity*(value: string): bool =
   if not value.hasHexHeader:
@@ -158,13 +171,25 @@ proc hexDataStr*(value: string): HexDataStr {.inline.} =
   value.validateHexData
   result = value.HexDataStr
 
+proc hexDataStr*(value: openArray[byte]): HexDataStr {.inline.} =
+  result = HexDataStr("0x" & value.toHex)
+
+proc hexDataStr*(value: Uint256): HexDataStr {.inline.} =
+  result = HexDataStr("0x" & toBytesBE(value).toHex)
+
 proc ethAddressStr*(value: string): EthAddressStr {.inline.} =
   value.validateHexAddressStr
   result = value.EthAddressStr
 
+func ethAddressStr*(x: EthAddress): EthAddressStr {.inline.} =
+  result = EthAddressStr("0x" & toHex(x))
+
 proc ethHashStr*(value: string): EthHashStr {.inline.} =
   value.validateHashStr
   result = value.EthHashStr
+
+func ethHashStr*(value: Hash256): EthHashStr {.inline.} =
+  result = EthHashStr("0x" & value.data.toHex)
 
 # Converters for use in RPC
 
@@ -175,7 +200,6 @@ proc `%`*(value: HexStrings): JsonNode =
   result = %(value.string)
 
 # Overloads to support expected representation of hex data
-
 proc `%`*(value: EthAddress): JsonNode =
   result = %("0x" & value.toHex)
 
@@ -187,7 +211,7 @@ proc `%`*(value: Hash256): JsonNode =
   result = %("0x" & value.data.toHex)
 
 proc `%`*(value: UInt256): JsonNode =
-  result = %("0x" & value.toString)
+  result = %("0x" & value.toString(16))
 
 proc `%`*(value: ref BloomFilter): JsonNode =
   result = %("0x" & toHex[256](value[]))
@@ -204,17 +228,16 @@ proc `%`*(value: SymKey): JsonNode =
 proc `%`*(value: whisper_protocol.Topic): JsonNode =
   result = %("0x" & value.toHex)
 
-proc `%`*(value: Bytes): JsonNode =
+proc `%`*(value: seq[byte]): JsonNode =
   result = %("0x" & value.toHex)
-
 
 # Helpers for the fromJson procs
 
 proc toPublicKey*(key: string): PublicKey {.inline.} =
-  result = initPublicKey(key[4 .. ^1])
+  result = PublicKey.fromHex(key[4 .. ^1]).tryGet()
 
 proc toPrivateKey*(key: string): PrivateKey {.inline.} =
-  result = initPrivateKey(key[2 .. ^1])
+  result = PrivateKey.fromHex(key[2 .. ^1]).tryGet()
 
 proc toSymKey*(key: string): SymKey {.inline.} =
   hexToByteArray(key[2 .. ^1], result)
@@ -247,6 +270,13 @@ proc fromJson*(n: JsonNode, argName: string, result: var EthAddressStr) =
     raise newException(ValueError, invalidMsg(argName) & "\" as an Ethereum address \"" & hexStr & "\"")
   result = hexStr.EthAddressStr
 
+proc fromJson*(n: JsonNode, argName: string, result: var EthAddress) =
+  n.kind.expect(JString, argName)
+  let hexStr = n.getStr()
+  if not hexStr.isValidEthAddress:
+    raise newException(ValueError, invalidMsg(argName) & "\" as an Ethereum address \"" & hexStr & "\"")
+  hexToByteArray(hexStr, result)
+
 proc fromJson*(n: JsonNode, argName: string, result: var EthHashStr) =
   n.kind.expect(JString, argName)
   let hexStr = n.getStr()
@@ -264,7 +294,7 @@ proc fromJson*(n: JsonNode, argName: string, result: var Identifier) =
 proc fromJson*(n: JsonNode, argName: string, result: var UInt256) =
   n.kind.expect(JString, argName)
   let hexStr = n.getStr()
-  if hexStr.len <= 66 and hexStr.isValidHexData:
+  if not (hexStr.len <= 66 and hexStr.isValidHexQuantity):
     raise newException(ValueError, invalidMsg(argName) & " as a UInt256 \"" & hexStr & "\"")
   result = readUintBE[256](hexToPaddedByteArray[32](hexStr))
 
@@ -299,16 +329,19 @@ proc fromJson*(n: JsonNode, argName: string, result: var whisper_protocol.Topic)
 # Following procs currently required only for testing, the `createRpcSigs` macro
 # requires it as it will convert the JSON results back to the original Nim
 # types, but it needs the `fromJson` calls for those specific Nim types to do so
-proc fromJson*(n: JsonNode, argName: string, result: var Bytes) =
+proc fromJson*(n: JsonNode, argName: string, result: var seq[byte]) =
   n.kind.expect(JString, argName)
   let hexStr = n.getStr()
   if not hexStr.isValidHexData:
     raise newException(ValueError, invalidMsg(argName) & " as a hex data \"" & hexStr & "\"")
-  result = hexToSeqByte(hexStr.string)
+  result = hexToSeqByte(hexStr)
 
 proc fromJson*(n: JsonNode, argName: string, result: var Hash256) =
   n.kind.expect(JString, argName)
   let hexStr = n.getStr()
   if not hexStr.isValidHash256:
     raise newException(ValueError, invalidMsg(argName) & " as a Hash256 \"" & hexStr & "\"")
-  hexToByteArray(hexStr.string, result.data)
+  hexToByteArray(hexStr, result.data)
+
+proc fromJson*(n: JsonNode, argName: string, result: var JsonNode) =
+  result = n

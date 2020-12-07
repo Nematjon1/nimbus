@@ -8,10 +8,10 @@
 # those terms.
 
 import
-  parseopt, strutils, macros, os, times,
+  parseopt, strutils, macros, os, times, json, tables, stew/[byteutils],
   chronos, eth/[keys, common, p2p, net/nat], chronicles, nimcrypto/hash,
-  eth/p2p/rlpx_protocols/whisper_protocol,
-  ./db/select_backend,
+  eth/p2p/bootnodes, eth/p2p/rlpx_protocols/whisper_protocol,
+  ./db/select_backend, eth/keys,
   ./vm/interpreter/vm_forks
 
 const
@@ -33,52 +33,14 @@ const
   NimbusIdent* = "$1/$2 ($3/$4)" % [NimbusName, NimbusVersion, hostCPU, hostOS]
   ## project ident name for networking services
 
+  GitRevision = staticExec("git rev-parse --short HEAD").replace("\n") # remove CR
+
+  NimVersion = staticExec("nim --version")
+
 let
-  NimbusCopyright* = "Copyright (C) 2018-" & $(now().utc.year) & " Status Research & Development GmbH"
-  ## copyright string
-
-  NimbusHeader* = NimbusName & " Version " & NimbusVersion &
-                  " [" & hostOS & ": " & hostCPU & ", " & nimbus_db_backend & "]\r\n" &
-                  NimbusCopyright
-  ## is the header which printed, when nimbus binary got executed
-
-const
-  MainnetBootnodes = [
-    "enode://a979fb575495b8d6db44f750317d0f4622bf4c2aa3365d6af7c284339968eef29b69ad0dce72a4d8db5ebb4968de0e3bec910127f134779fbcb0cb6d3331163c@52.16.188.185:30303" , # IE
-    "enode://3f1d12044546b76342d59d4a05532c14b85aa669704bfe1f864fe079415aa2c02d743e03218e57a33fb94523adb54032871a6c51b2cc5514cb7c7e35b3ed0a99@13.93.211.84:30303",   # US-WEST
-    "enode://78de8a0916848093c73790ead81d1928bec737d565119932b98c6b100d944b7a95e94f847f689fc723399d2e31129d182f7ef3863f2b4c820abbf3ab2722344d@191.235.84.50:30303",  # BR
-    "enode://158f8aab45f6d19c6cbf4a089c2670541a8da11978a2f90dbf6a502a4a3bab80d288afdbeb7ec0ef6d92de563767f3b1ea9e8e334ca711e9f8e2df5a0385e8e6@13.75.154.138:30303",  # AU
-    "enode://1118980bf48b0a3640bdba04e0fe78b1add18e1cd99bf22d53daac1fd9972ad650df52176e7c7d89d1114cfef2bc23a2959aa54998a46afcf7d91809f0855082@52.74.57.123:30303",   # SG
-    "enode://979b7fa28feeb35a4741660a16076f1943202cb72b6af70d327f053e248bab9ba81760f39d0701ef1d8f89cc1fbd2cacba0710a12cd5314d5e0c9021aa3637f9@5.1.83.226:30303"      # DE
-  ]
-
-  RopstenBootnodes = [
-    "enode://30b7ab30a01c124a6cceca36863ece12c4f5fa68e3ba9b0b51407ccc002eeed3b3102d20a88f1c1d3c3154e2449317b8ef95090e77b312d5cc39354f86d5d606@52.176.7.10:30303",    # US-Azure geth
-    "enode://865a63255b3bb68023b6bffd5095118fcc13e79dcf014fe4e47e065c350c7cc72af2e53eff895f11ba1bbb6a2b33271c1116ee870f266618eadfc2e78aa7349c@52.176.100.77:30303",  # US-Azure parity
-    "enode://6332792c4a00e3e4ee0926ed89e0d27ef985424d97b6a45bf0f23e51f0dcb5e66b875777506458aea7af6f9e4ffb69f43f3778ee73c81ed9d34c51c4b16b0b0f@52.232.243.152:30303", # Parity
-    "enode://94c15d1b9e2fe7ce56e458b9a3b672ef11894ddedd0c6f247e0f1d3487f52b66208fb4aeb8179fce6e3a749ea93ed147c37976d67af557508d199d9594c35f09@192.81.208.223:30303"  # @gpip
-  ]
-
-  RinkebyBootnodes = [
-    "enode://a24ac7c5484ef4ed0c5eb2d36620ba4e4aa13b8c84684e1b4aab0cebea2ae45cb4d375b77eab56516d34bfbd3c1a833fc51296ff084b770b94fb9028c4d25ccf@52.169.42.101:30303", # IE
-    "enode://343149e4feefa15d882d9fe4ac7d88f885bd05ebb735e547f12e12080a9fa07c8014ca6fd7f373123488102fe5e34111f8509cf0b7de3f5b44339c9f25e87cb8@52.3.158.184:30303",  # INFURA
-    "enode://b6b28890b006743680c52e64e0d16db57f28124885595fa03a562be1d2bf0f3a1da297d56b13da25fb992888fd556d4c1a27b1f39d531bde7de1921c90061cc6@159.89.28.211:30303", # AKASHA
-  ]
-
-  DiscoveryV5Bootnodes = [
-    "enode://06051a5573c81934c9554ef2898eb13b33a34b94cf36b202b69fde139ca17a85051979867720d4bdae4323d4943ddf9aeeb6643633aa656e0be843659795007a@35.177.226.168:30303",
-    "enode://0cc5f5ffb5d9098c8b8c62325f3797f56509bff942704687b6530992ac706e2cb946b90a34f1f19548cd3c7baccbcaea354531e5983c7d1bc0dee16ce4b6440b@40.118.3.223:30304",
-    "enode://1c7a64d76c0334b0418c004af2f67c50e36a3be60b5e4790bdac0439d21603469a85fad36f2473c9a80eb043ae60936df905fa28f1ff614c3e5dc34f15dcd2dc@40.118.3.223:30306",
-    "enode://85c85d7143ae8bb96924f2b54f1b3e70d8c4d367af305325d30a61385a432f247d2c75c45c6b4a60335060d072d7f5b35dd1d4c45f76941f62a4f83b6e75daaf@40.118.3.223:30307"
-  ]
-
-  KovanBootnodes = [
-    "enode://56abaf065581a5985b8c5f4f88bd202526482761ba10be9bfdcd14846dd01f652ec33fde0f8c0fd1db19b59a4c04465681fcef50e11380ca88d25996191c52de@40.71.221.215:30303",
-    "enode://d07827483dc47b368eaf88454fb04b41b7452cf454e194e2bd4c14f98a3278fed5d819dbecd0d010407fc7688d941ee1e58d4f9c6354d3da3be92f55c17d7ce3@52.166.117.77:30303",
-    "enode://8fa162563a8e5a05eef3e1cd5abc5828c71344f7277bb788a395cce4a0e30baf2b34b92fe0b2dbbba2313ee40236bae2aab3c9811941b9f5a7e8e90aaa27ecba@52.165.239.18:30303",
-    "enode://7e2e7f00784f516939f94e22bdc6cf96153603ca2b5df1c7cc0f90a38e7a2f218ffb1c05b156835e8b49086d11fdd1b3e2965be16baa55204167aa9bf536a4d9@52.243.47.56:30303",
-    "enode://0518a3d35d4a7b3e8c433e7ffd2355d84a1304ceb5ef349787b556197f0c87fad09daed760635b97d52179d645d3e6d16a37d2cc0a9945c2ddf585684beb39ac@40.68.248.100:30303"
-  ]
+  NimbusCopyright* = "Copyright (c) 2018-" & $(now().utc.year) & " Status Research & Development GmbH"
+  NimbusHeader* = "$# Version $# [$#: $#, $#, $#]\p$#\p\p$#\p" %
+    [NimbusName, NimbusVersion, hostOS, hostCPU, nimbus_db_backend, GitRevision, NimbusCopyright, NimVersion]
 
 type
   ConfigStatus* = enum
@@ -114,6 +76,7 @@ type
     MordenNet = 2
     RopstenNet = 3
     RinkebyNet = 4
+    GoerliNet = 5
     KovanNet = 42
 
   NetworkFlags* = enum
@@ -135,6 +98,8 @@ type
     staticNodes*: seq[ENode]      ## List of static nodes to connect to
     bindPort*: uint16             ## Main TCP bind port
     discPort*: uint16             ## Discovery UDP bind port
+    metricsServer*: bool           ## Enable metrics server
+    metricsServerPort*: uint16    ## metrics HTTP server port
     maxPeers*: int                ## Maximum allowed number of peers
     maxPendingPeers*: int         ## Maximum allowed pending peers
     networkId*: uint              ## Network ID as integer
@@ -149,10 +114,17 @@ type
     flags*: set[DebugFlags]       ## Debug flags
     logLevel*: LogLevel           ## Log level
     logFile*: string              ## Log file
+    logMetrics*: bool             ## Enable metrics logging
+    logMetricsInterval*: int      ## Metrics logging interval
 
   PruneMode* {.pure.} = enum
     Full
     Archive
+
+  NimbusAccount* = object
+    privateKey*: PrivateKey
+    keystore*: JsonNode
+    unlocked*: bool
 
   ChainConfig* = object
     chainId*: uint
@@ -169,68 +141,293 @@ type
 
     byzantiumBlock*: BlockNumber
     constantinopleBlock*: BlockNumber
+    petersburgBlock*: BlockNumber
+    istanbulBlock*: BlockNumber
+    muirGlacierBlock*: BlockNumber
+    berlinBlock*: BlockNumber
 
   NimbusConfiguration* = ref object
     ## Main Nimbus configuration object
     dataDir*: string
-    keyFile*: string
+    keyStore*: string
     prune*: PruneMode
     rpc*: RpcConfiguration        ## JSON-RPC configuration
     net*: NetConfiguration        ## Network configuration
     debug*: DebugConfiguration    ## Debug configuration
     shh*: WhisperConfig           ## Whisper configuration
+    customGenesis*: CustomGenesisConfig  ## Custom Genesis Configuration
+    # You should only create one instance of the RNG per application / library
+    # Ref is used so that it can be shared between components
+    rng*: ref BrHmacDrbgContext
+    accounts*: Table[EthAddress, NimbusAccount]
+
+  CustomGenesisConfig = object
+    chainId*: uint
+    homesteadBlock*: BlockNumber
+    daoForkBlock*: BlockNumber
+    daoForkSupport*: bool
+    eip150Block*: BlockNumber
+    eip150Hash*: Hash256
+    eip155Block*: BlockNumber
+    eip158Block*: BlockNumber
+    byzantiumBlock*: BlockNumber
+    constantinopleBlock*: BlockNumber
+    petersburgBlock*: BlockNumber
+    istanbulBlock*: BlockNumber
+    muirGlacierBlock*: BlockNumber
+    berlinBlock*: BlockNumber
+    nonce*: BlockNonce
+    extraData*: seq[byte]
+    gasLimit*: int64
+    difficulty*: UInt256
+    prealloc*: JsonNode
+    mixHash*: Hash256
+    coinBase*: EthAddress
+    timestamp*: EthTime
 
 const
   defaultRpcApi = {RpcFlags.Eth, RpcFlags.Shh}
   defaultProtocols = {ProtocolFlags.Eth, ProtocolFlags.Shh}
   defaultLogLevel = LogLevel.WARN
+  defaultNetwork = MainNet
 
 var nimbusConfig {.threadvar.}: NimbusConfiguration
 
 proc getConfiguration*(): NimbusConfiguration {.gcsafe.}
+
+proc toFork*(c: ChainConfig, number: BlockNumber): Fork =
+  if number >= c.berlinBlock: FkBerlin
+  elif number >= c.istanbulBlock: FkIstanbul
+  elif number >= c.petersburgBlock: FkPetersburg
+  elif number >= c.constantinopleBlock: FkConstantinople
+  elif number >= c.byzantiumBlock: FkByzantium
+  elif number >= c.eip158Block: FkSpurious
+  elif number >= c.eip150Block: FkTangerine
+  elif number >= c.homesteadBlock: FkHomestead
+  else: FkFrontier
+
+proc privateChainConfig*(): ChainConfig =
+  let config = getConfiguration()
+  result = ChainConfig(
+    chainId:          config.customGenesis.chainId,
+    homesteadBlock:   config.customGenesis.homesteadBlock,
+    daoForkSupport:   config.customGenesis.daoForkSupport,
+    daoForkBlock:     config.customGenesis.daoForkBlock,
+    eip150Block:      config.customGenesis.eip150Block,
+    eip150Hash:       config.customGenesis.eip150Hash,
+    eip155Block:      config.customGenesis.eip155Block,
+    eip158Block:      config.customGenesis.eip158Block,
+    byzantiumBlock:   config.customGenesis.byzantiumBlock,
+    constantinopleBlock: config.customGenesis.constantinopleBlock,
+    petersburgBlock:  config.customGenesis.petersburgBlock,
+    istanbulBlock:    config.customGenesis.istanbulBlock,
+    muirGlacierBlock: config.customGenesis.muirGlacierBlock,
+    berlinBlock: config.customGenesis.berlinBlock
+  )
+  trace "Custom genesis block configuration loaded", configuration=result
 
 proc publicChainConfig*(id: PublicNetwork): ChainConfig =
   result = case id
   of MainNet:
     ChainConfig(
       chainId:        MainNet.uint,
-      homesteadBlock: forkBlocks[FkHomestead],
-      daoForkBlock:   forkBlocks[FkDao],
+      homesteadBlock: 1_150_000.toBlockNumber, # 14/03/2016 20:49:53
+      daoForkBlock:   1_920_000.toBlockNumber,
       daoForkSupport: true,
-      eip150Block:    forkBlocks[FkTangerine],
+      eip150Block:    2_463_000.toBlockNumber, # 18/10/2016 17:19:31
       eip150Hash:     toDigest("2086799aeebeae135c246c65021c82b4e15a2c451340993aacfd2751886514f0"),
-      eip155Block:    forkBlocks[FkSpurious],
-      eip158Block:    forkBlocks[FkSpurious],
-      byzantiumBlock: forkBlocks[FkByzantium]
+      eip155Block:    2_675_000.toBlockNumber, # 22/11/2016 18:15:44
+      eip158Block:    2_675_000.toBlockNumber,
+      byzantiumBlock: 4_370_000.toBlockNumber, # 16/10/2017 09:22:11
+      constantinopleBlock: 7_280_000.toBlockNumber, # Never Occured in MainNet
+      petersburgBlock:7_280_000.toBlockNumber, # 28/02/2019 07:52:04
+      istanbulBlock:  9_069_000.toBlockNumber, # 08/12/2019 12:25:09
+      muirGlacierBlock: 9_200_000.toBlockNumber, # 02/01/2020 08:30:49
+      berlinBlock: high(BlockNumber).toBlockNumber
     )
   of RopstenNet:
     ChainConfig(
       chainId:        RopstenNet.uint,
-      homesteadBlock: 0.u256,
-      daoForkSupport: true,
-      eip150Block:    0.u256,
+      homesteadBlock: 0.toBlockNumber,
+      daoForkSupport: false,
+      eip150Block:    0.toBlockNumber,
       eip150Hash:     toDigest("41941023680923e0fe4d74a34bdac8141f2540e3ae90623718e47d66d1ca4a2d"),
-      eip155Block:    10.u256,
-      eip158Block:    10.u256,
-      byzantiumBlock: 1700000.u256
+      eip155Block:    10.toBlockNumber,
+      eip158Block:    10.toBlockNumber,
+      byzantiumBlock: 1_700_000.toBlockNumber,
+      constantinopleBlock: 4_230_000.toBlockNumber,
+      petersburgBlock:4_939_394.toBlockNumber,
+      istanbulBlock:  6_485_846.toBlockNumber,
+      muirGlacierBlock: 7_117_117.toBlockNumber,
+      berlinBlock: high(BlockNumber).toBlockNumber
     )
   of RinkebyNet:
     ChainConfig(
       chainId:        RinkebyNet.uint,
-      homesteadBlock: 1.u256,
-      daoForkSupport: true,
-      eip150Block:    2.u256,
+      homesteadBlock: 1.toBlockNumber,
+      daoForkSupport: false,
+      eip150Block:    2.toBlockNumber,
       eip150Hash:     toDigest("9b095b36c15eaf13044373aef8ee0bd3a382a5abb92e402afa44b8249c3a90e9"),
-      eip155Block:    3.u256,
-      eip158Block:    3.u256,
-      byzantiumBlock: 1035301.u256
+      eip155Block:    3.toBlockNumber,
+      eip158Block:    3.toBlockNumber,
+      byzantiumBlock: 1_035_301.toBlockNumber,
+      constantinopleBlock: 3_660_663.toBlockNumber,
+      petersburgBlock:4_321_234.toBlockNumber,
+      istanbulBlock:  5_435_345.toBlockNumber,
+      muirGlacierBlock: high(BlockNumber).toBlockNumber,
+      berlinBlock: high(BlockNumber).toBlockNumber
     )
+  of GoerliNet:
+    ChainConfig(
+      chainId:        GoerliNet.uint,
+      homesteadBlock: 0.toBlockNumber,
+      daoForkSupport: false,
+      eip150Block:    0.toBlockNumber,
+      eip150Hash:     toDigest("0000000000000000000000000000000000000000000000000000000000000000"),
+      eip155Block:    0.toBlockNumber,
+      eip158Block:    0.toBlockNumber,
+      byzantiumBlock: 0.toBlockNumber,
+      constantinopleBlock: 0.toBlockNumber,
+      petersburgBlock: 0.toBlockNumber,
+      istanbulBlock:  1_561_651.toBlockNumber,
+      muirGlacierBlock: high(BlockNumber).toBlockNumber,
+      berlinBlock: high(BlockNumber).toBlockNumber
+    )
+  of CustomNet:
+    privateChainConfig()
   else:
     error "No chain config for public network", networkId = id
     doAssert(false, "No chain config for " & $id)
     ChainConfig()
 
   result.chainId = uint(id)
+
+proc processCustomGenesisConfig(customGenesis: JsonNode): ConfigStatus =
+  ## Parses Custom Genesis Block config options when customnetwork option provided
+
+  template checkForFork(chain, currentFork, previousFork: untyped) =
+  # Template to load fork blocks and validate order
+    let currentForkName = currentFork.astToStr()
+    if chain.hasKey(currentForkName):
+      if chain[currentForkName].kind == JInt:
+        currentFork = chain[currentForkName].getInt().toBlockNumber
+        if currentFork < previousFork:
+          error "Forks can't be assigned out of order"
+          quit(1)
+      else:
+        error "Invalid block value provided for", currentForkName, invalidValue=currentFork
+        quit(1)
+
+  proc parseConfig(T: type, c: JsonNode, field: string): T =
+    when T is string:
+      c[field].getStr()
+    elif T is Uint256:
+      parseHexInt(c[field].getStr()).u256
+    elif T is bool:
+      c[field].getBool()
+    elif T is Hash256:
+      MDigest[256].fromHex(c[field].getStr())
+    elif T is uint:
+      c[field].getInt().uint
+    elif T is Blocknonce:
+      (parseHexInt(c[field].getStr()).uint64).toBlockNonce
+    elif T is EthTime:
+      fromHex[int64](c[field].getStr()).fromUnix
+    elif T is EthAddress:
+      parseAddress(c[field].getStr())
+    elif T is seq[byte]:
+      hexToSeqByte(c[field].getStr())
+    elif T is int64:
+      fromHex[int64](c[field].getStr())
+
+
+  template validateConfigValue(chainDetails, field, jtype, T: untyped, checkError: static[bool] = true) =
+    let fieldName = field.astToStr()
+    if chainDetails.hasKey(fieldName):
+      if chainDetails[fieldName].kind == jtype:
+        field = parseConfig(T, chainDetails, fieldName)
+      else:
+        error "Invalid value provided for ", fieldName
+        quit(1)
+    else:
+      when checkError:
+        error "No value found in genesis block for", fieldName
+        quit(1)
+
+  let config = getConfiguration()
+  result = Success
+  var
+    chainId = 0.uint
+    homesteadBlock, daoForkblock, eip150Block, eip155Block, eip158Block, byzantiumBlock, constantinopleBlock = 0.toBlockNumber
+    petersburgBlock, istanbulBlock, muirGlacierBlock, berlinBlock = 0.toBlockNumber
+    eip150Hash, mixHash : MDigest[256]
+    daoForkSupport = false
+    nonce = 66.toBlockNonce
+    extraData = hexToSeqByte("0x")
+    gasLimit = 16777216.int64
+    difficulty = 1048576.u256
+    alloc = parseJson("{}")
+    timestamp : EthTime
+    coinbase : EthAddress
+
+
+  if customGenesis.hasKey("config"):
+  # Validate all fork blocks for custom genesis
+    let forkDetails = customGenesis["config"]
+    validateConfigValue(forkDetails, chainId, JInt, uint)
+    config.net.networkId = chainId
+    checkForFork(forkDetails, homesteadBlock, 0.toBlockNumber)
+    validateConfigValue(forkDetails, daoForkSupport, JBool, bool, checkError=false)
+    if daoForkSupport == true:
+      checkForFork(forkDetails, daoForkBlock, 0.toBlockNumber)
+
+    checkForFork(forkDetails, eip150Block, homesteadBlock)
+    validateConfigValue(forkDetails, eip150Hash, JString, Hash256)
+    checkForFork(forkDetails, eip155Block, eip150Block)
+    checkForFork(forkDetails, eip158Block, eip155Block)
+    checkForFork(forkDetails, byzantiumBlock, eip158Block)
+    checkForFork(forkDetails, constantinopleBlock, byzantiumBlock)
+    checkForFork(forkDetails, petersburgBlock, constantinopleBlock)
+    checkForFork(forkDetails, istanbulBlock, petersburgBlock)
+    checkForFork(forkDetails, muirGlacierBlock, istanbulBlock)
+    checkForFork(forkDetails, istanbulBlock, berlinBlock)
+  else:
+    error "No chain configuration found."
+    quit(1)
+  validateConfigValue(customGenesis, nonce, JString, BlockNonce)
+  validateConfigValue(customGenesis, extraData, JSTring, seq[byte], checkError = false)
+  validateConfigValue(customGenesis, gasLimit, JString, int64, checkError = false)
+  validateConfigValue(customGenesis, difficulty, JString, UInt256)
+  if customGenesis.hasKey("alloc"):
+    alloc = customGenesis["alloc"]
+
+  validateConfigValue(customGenesis, mixHash, JString, Hash256)
+  validateConfigValue(customGenesis, coinbase, JString, EthAddress, checkError = false)
+  validateConfigValue(customGenesis, timestamp, JString, EthTime, checkError = false)
+
+  config.customGenesis = CustomGenesisConfig(
+    chainId:          chainId,
+    homesteadBlock:   homesteadBlock,
+    eip150Block:      eip150Block,
+    eip150Hash:       eip150Hash,
+    eip155Block:      eip155Block,
+    eip158Block:      eip158Block,
+    daoForkSupport:   daoForkSupport,
+    byzantiumBlock:   byzantiumBlock,
+    constantinopleBlock: constantinopleBlock,
+    petersburgBlock:  petersburgBlock,
+    istanbulBlock:    istanbulBlock,
+    muirGlacierBlock: muirGlacierBlock,
+    berlinBlock:      berlinBlock,
+    nonce:            nonce,
+    extraData:        extraData,
+    gasLimit:         gasLimit,
+    difficulty:       difficulty,
+    prealloc:         alloc,
+    mixHash:          mixHash,
+    coinbase:         coinbase,
+    timestamp:        timestamp
+  )
 
 proc processList(v: string, o: var seq[string]) =
   ## Process comma-separated list of strings.
@@ -244,7 +441,7 @@ proc processInteger*(v: string, o: var int): ConfigStatus =
   try:
     o  = parseInt(v)
     result = Success
-  except:
+  except ValueError:
     result = ErrorParseOption
 
 proc processFloat*(v: string, o: var float): ConfigStatus =
@@ -252,7 +449,7 @@ proc processFloat*(v: string, o: var float): ConfigStatus =
   try:
     o  = parseFloat(v)
     result = Success
-  except:
+  except ValueError:
     result = ErrorParseOption
 
 proc processAddressPortsList(v: string,
@@ -264,12 +461,12 @@ proc processAddressPortsList(v: string,
     var tas4: seq[TransportAddress]
     var tas6: seq[TransportAddress]
     try:
-      tas4 = resolveTAddress(item, IpAddressFamily.IPv4)
-    except:
+      tas4 = resolveTAddress(item, AddressFamily.IPv4)
+    except CatchableError:
       discard
     try:
-      tas6 = resolveTAddress(item, IpAddressFamily.IPv6)
-    except:
+      tas6 = resolveTAddress(item, AddressFamily.IPv6)
+    except CatchableError:
       discard
     if len(tas4) == 0 and len(tas6) == 0:
       result = ErrorParseOption
@@ -307,8 +504,9 @@ proc processProtocolList(v: string, flags: var set[ProtocolFlags]): ConfigStatus
 
 proc processENode(v: string, o: var ENode): ConfigStatus =
   ## Convert string to ENode.
-  let res = initENode(v, o)
-  if res == ENodeStatus.Success:
+  let res = ENode.fromString(v)
+  if res.isOk:
+    o = res[]
     result = Success
   else:
     result = ErrorParseOption
@@ -328,18 +526,19 @@ proc processENodesList(v: string, o: var seq[ENode]): ConfigStatus =
 
 proc processPrivateKey(v: string, o: var PrivateKey): ConfigStatus =
   ## Convert hexadecimal string to private key object.
-  try:
-    o = initPrivateKey(v)
-    result = Success
-  except:
-    result = ErrorParseOption
+  let seckey = PrivateKey.fromHex(v)
+  if seckey.isOk():
+    o = seckey[]
+    return Success
+
+  result = ErrorParseOption
 
 # proc processHexBytes(v: string, o: var seq[byte]): ConfigStatus =
 #   ## Convert hexadecimal string to seq[byte].
 #   try:
 #     o = fromHex(v)
 #     result = Success
-#   except:
+#   except CatchableError:
 #     result = ErrorParseOption
 
 # proc processHexString(v: string, o: var string): ConfigStatus =
@@ -347,7 +546,7 @@ proc processPrivateKey(v: string, o: var PrivateKey): ConfigStatus =
 #   try:
 #     o = parseHexStr(v)
 #     result = Success
-#   except:
+#   except CatchableError:
 #     result = ErrorParseOption
 
 # proc processJson(v: string, o: var JsonNode): ConfigStatus =
@@ -355,7 +554,7 @@ proc processPrivateKey(v: string, o: var PrivateKey): ConfigStatus =
 #   try:
 #     o = parseJson(v)
 #     result = Success
-#   except:
+#   except CatchableError:
 #     result = ErrorParseOption
 
 proc processPruneList(v: string, flags: var PruneMode): ConfigStatus =
@@ -374,11 +573,8 @@ proc processEthArguments(key, value: string): ConfigStatus =
   result = Success
   let config = getConfiguration()
   case key.toLowerAscii()
-  of "keyfile":
-    if fileExists(value):
-      config.keyFile = value
-    else:
-      result = ErrorIncorrectOption
+  of "keystore":
+    config.keyStore = value
   of "datadir":
     config.dataDir = value
   of "prune":
@@ -435,6 +631,8 @@ proc setNetwork(conf: var NetConfiguration, id: PublicNetwork) =
     conf.bootNodes.setBootnodes(RopstenBootnodes)
   of RinkebyNet:
     conf.bootNodes.setBootnodes(RinkebyBootnodes)
+  of GoerliNet:
+    conf.bootNodes.setBootnodes(GoerliBootnodes)
   of KovanNet:
     conf.bootNodes.setBootnodes(KovanBootnodes)
   of CustomNet:
@@ -469,10 +667,27 @@ proc processNetArguments(key, value: string): ConfigStatus =
     config.net.setNetwork(RopstenNet)
   elif skey == "rinkeby":
     config.net.setNetwork(RinkebyNet)
-  elif skey == "morden":
-    config.net.setNetwork(MordenNet)
+  elif skey == "goerli":
+    config.net.setNetwork(GoerliNet)
   elif skey == "kovan":
     config.net.setNetwork(KovanNet)
+  elif skey == "customnetwork":
+    if value == "":
+      error "No genesis block config provided for custom network", network=key
+      result = ErrorParseOption
+    else:
+      try:
+        result = processCustomGenesisConfig(parseFile(value))
+      except IOError:
+        error "Genesis block config file not found", invalidFileName=value
+        result = ErrorParseOption
+      except JsonParsingError:
+        error "Invalid genesis block config file format", invalidFileName=value
+        result = ErrorIncorrectOption
+      except:
+        var msg = getCurrentExceptionMsg()
+        error "Error loading genesis block config file", invalidFileName=msg
+        result = Error
   elif skey == "networkid":
     var res = 0
     result = processInteger(value, res)
@@ -493,6 +708,13 @@ proc processNetArguments(key, value: string): ConfigStatus =
     result = processInteger(value, res)
     if result == Success:
       config.net.discPort = uint16(res and 0xFFFF)
+  elif skey == "metricsserver" and defined(insecure):
+    config.net.metricsServer = true
+  elif skey == "metricsserverport" and defined(insecure):
+    var res = 0
+    result = processInteger(value, res)
+    if result == Success:
+      config.net.metricsServerPort = uint16(res and 0xFFFF)
   elif skey == "maxpeers":
     var res = 0
     result = processInteger(value, res)
@@ -584,6 +806,15 @@ proc processDebugArguments(key, value: string): ConfigStatus =
       result = ErrorIncorrectOption
     else:
       config.debug.logFile = value
+  elif skey == "logmetrics":
+    config.debug.logMetrics = true
+  elif skey == "logmetricsinterval":
+    var res = 0
+    result = processInteger(value, res)
+    if result == Success:
+      config.debug.logMetricsInterval = res
+  else:
+    result = EmptyOption
 
 proc dumpConfiguration*(): string =
   ## Dumps current configuration as string
@@ -607,32 +838,44 @@ template processArgument(processor, key, value, msg: untyped) =
 
 proc getDefaultDataDir*(): string =
   when defined(windows):
-    "AppData" / "Roaming" / "Nimbus" / "DB"
+    "AppData" / "Roaming" / "Nimbus"
   elif defined(macosx):
-    "Library" / "Application Support" / "Nimbus" / "DB"
+    "Library" / "Application Support" / "Nimbus"
   else:
-    ".cache" / "nimbus" / "db"
+    ".cache" / "nimbus"
+
+proc getDefaultKeystoreDir*(): string =
+  getDefaultDataDir() / "keystore"
 
 proc initConfiguration(): NimbusConfiguration =
   ## Allocates and initializes `NimbusConfiguration` with default values
   result = new NimbusConfiguration
+  result.rng = newRng()
+  result.accounts = initTable[EthAddress, NimbusAccount]()
+
   ## RPC defaults
   result.rpc.flags = {}
   result.rpc.binds = @[initTAddress("127.0.0.1:8545")]
 
   ## Network defaults
-  result.net.setNetwork(MainNet)
+  result.net.setNetwork(defaultNetwork)
   result.net.maxPeers = 25
   result.net.maxPendingPeers = 0
   result.net.bindPort = 30303'u16
   result.net.discPort = 30303'u16
+  result.net.metricsServer = false
+  result.net.metricsServerPort = 9093'u16
   result.net.ident = NimbusIdent
   result.net.nat = NatAny
   result.net.protocols = defaultProtocols
+  result.net.nodekey = random(PrivateKey, result.rng[])
 
-  const dataDir = getDefaultDataDir()
+  const
+    dataDir = getDefaultDataDir()
+    keystore = getDefaultKeystoreDir()
 
   result.dataDir = getHomeDir() / dataDir
+  result.keystore = getHomeDir() / keystore
   result.prune = PruneMode.Full
 
   ## Whisper defaults
@@ -644,6 +887,8 @@ proc initConfiguration(): NimbusConfiguration =
   ## Debug defaults
   result.debug.flags = {}
   result.debug.logLevel = defaultLogLevel
+  result.debug.logMetrics = false
+  result.debug.logMetricsInterval = 10
 
 proc getConfiguration*(): NimbusConfiguration =
   ## Retreive current configuration object `NimbusConfiguration`.
@@ -658,13 +903,21 @@ proc getHelpString*(): string =
       continue
     logLevels.add($level)
 
+  when defined(insecure):
+    let metricsServerHelp = """
+
+  --metricsServer         Enable the metrics HTTP server
+  --metricsServerPort:<value> Metrics HTTP server port on localhost (default: 9093)"""
+  else:
+    let metricsServerHelp = ""
+
   result = """
 
 USAGE:
   nimbus [options]
 
 ETHEREUM OPTIONS:
-  --keyfile:<value>       Use keyfile storage file
+  --keystore:<value>      Directory for the keystore (default = inside the datadir)
   --datadir:<value>       Base directory for all blockchain-related data
   --prune:<value>         Blockchain prune mode(full or archive)
 
@@ -674,21 +927,20 @@ NETWORKING OPTIONS:
   --bootnodesv5:<value>   Comma separated enode URLs for P2P v5 discovery bootstrap (light server, light nodes)
   --staticnodes:<value>   Comma separated enode URLs to connect with
   --port:<value>          Network listening TCP port (default: 30303)
-  --discport:<value>      Network listening UDP port (defaults to --port argument)
+  --discport:<value>      Network listening UDP port (defaults to --port argument)$7
   --maxpeers:<value>      Maximum number of network peers (default: 25)
   --maxpendpeers:<value>  Maximum number of pending connection attempts (default: 0)
   --nat:<value>           NAT port mapping mechanism (any|none|upnp|pmp|<external IP>) (default: "any")
   --nodiscover            Disables the peer discovery mechanism (manual peer addition)
   --v5discover            Enables the experimental RLPx V5 (Topic Discovery) mechanism
   --nodekey:<value>       P2P node private key (as hexadecimal string)
-  --testnet               Use Ethereum Ropsten Test Network (default)
+  --networkid:<value>     Network identifier (integer, 1=Frontier, 2=Morden (disused), 3=Ropsten, 4=Rinkeby) (default: $8)
+  --testnet               Use Ethereum Default Test Network (Ropsten)
+  --ropsten               Use Ethereum Ropsten Test Network
   --rinkeby               Use Ethereum Rinkeby Test Network
-  --ropsten               Use Ethereum Test Network (Ropsten Network)
-  --mainnet               Use Ethereum Main Network
-  --morden                Use Ethereum Morden Test Network
-  --networkid:<value>     Network identifier (integer, 1=Frontier, 2=Morden (disused), 3=Ropsten, 4=Rinkeby) (default: 3)
   --ident:<value>         Client identifier (default is '$1')
   --protocols:<value>     Enable specific set of protocols (default: $4)
+  --customnetwork         Use custom genesis block for private Ethereum Network (as /path/to/genesis.json)
 
 WHISPER OPTIONS:
   --shh-maxsize:<value>   Max message size accepted (default: $5)
@@ -703,6 +955,8 @@ API AND CONSOLE OPTIONS:
 LOGGING AND DEBUGGING OPTIONS:
   --log-level:<value>     One of: $2 (default: $3)
   --log-file:<value>      Optional log file, replacing stdout
+  --logMetrics            Enable metrics logging
+  --logMetricsInterval:<value> Interval at which to log metrics, in seconds (default: 10)
   --debug                 Enable debug mode
   --test:<value>          Perform specified test
 """ % [
@@ -711,64 +965,67 @@ LOGGING AND DEBUGGING OPTIONS:
     $defaultLogLevel,
     strip($defaultProtocols, chars = {'{','}'}),
     $defaultMaxMsgSize,
-    $defaultMinPow
+    $defaultMinPow,
+    metricsServerHelp,
+    $ord(defaultNetwork)
   ]
 
-proc processArguments*(msg: var string): ConfigStatus =
-  ## Process command line argument and update `NimbusConfiguration`.
-  let config = getConfiguration()
+when declared(os.paramCount): # not available with `--app:lib`
+  proc processArguments*(msg: var string): ConfigStatus =
+    ## Process command line argument and update `NimbusConfiguration`.
+    let config = getConfiguration()
 
-  # At this point `config.net.bootnodes` is likely populated with network default
-  # bootnodes. We want to override those if at least one custom bootnode is
-  # specified on the command line. We temporarily set `config.net.bootNodes`
-  # to empty seq, and in the end restore it if no bootnodes were spricified on
-  # the command line.
-  # TODO: This is pretty hacky and it's better to refactor it to make a clear
-  # distinction between default and custom bootnodes.
-  var tempBootNodes: seq[ENode]
-  swap(tempBootNodes, config.net.bootNodes)
-
-  # The same trick is done to discPort
-  config.net.discPort = 0
-
-  var opt = initOptParser()
-  var length = 0
-  for kind, key, value in opt.getopt():
-    result = Error
-    case kind
-    of cmdArgument:
-      discard
-    of cmdLongOption, cmdShortOption:
-      inc(length)
-      case key.toLowerAscii()
-        of "help", "h":
-          msg = getHelpString()
-          result = Success
-          break
-        of "version", "ver", "v":
-          msg = NimbusVersion
-          result = Success
-          break
-        else:
-          processArgument processEthArguments, key, value, msg
-          processArgument processRpcArguments, key, value, msg
-          processArgument processNetArguments, key, value, msg
-          processArgument processShhArguments, key, value, msg
-          processArgument processDebugArguments, key, value, msg
-          if result != Success:
-            msg = "Unknown option: '" & key & "'."
-    of cmdEnd:
-      doAssert(false) # we're never getting this kind here
-
-  if config.net.bootNodes.len == 0:
-    # No custom bootnodes were specified on the command line, restore to
-    # previous values
+    # At this point `config.net.bootnodes` is likely populated with network default
+    # bootnodes. We want to override those if at least one custom bootnode is
+    # specified on the command line. We temporarily set `config.net.bootNodes`
+    # to empty seq, and in the end restore it if no bootnodes were spricified on
+    # the command line.
+    # TODO: This is pretty hacky and it's better to refactor it to make a clear
+    # distinction between default and custom bootnodes.
+    var tempBootNodes: seq[ENode]
     swap(tempBootNodes, config.net.bootNodes)
 
-  if config.net.discPort == 0:
-    config.net.discPort = config.net.bindPort
+    # The same trick is done to discPort
+    config.net.discPort = 0
+
+    var opt = initOptParser()
+    var length = 0
+    for kind, key, value in opt.getopt():
+      result = Error
+      case kind
+      of cmdArgument:
+        discard
+      of cmdLongOption, cmdShortOption:
+        inc(length)
+        case key.toLowerAscii()
+          of "help", "h":
+            msg = getHelpString()
+            result = Success
+            break
+          of "version", "ver", "v":
+            msg = NimbusVersion
+            result = Success
+            break
+          else:
+            processArgument processEthArguments, key, value, msg
+            processArgument processRpcArguments, key, value, msg
+            processArgument processNetArguments, key, value, msg
+            processArgument processShhArguments, key, value, msg
+            processArgument processDebugArguments, key, value, msg
+            if result != Success:
+              msg = "Unknown option: '" & key & "'."
+              break
+      of cmdEnd:
+        doAssert(false) # we're never getting this kind here
+
+    if config.net.bootNodes.len == 0:
+      # No custom bootnodes were specified on the command line, restore to
+      # previous values
+      swap(tempBootNodes, config.net.bootNodes)
+
+    if config.net.discPort == 0:
+      config.net.discPort = config.net.bindPort
 
 proc processConfiguration*(pathname: string): ConfigStatus =
   ## Process configuration file `pathname` and update `NimbusConfiguration`.
   result = Success
-

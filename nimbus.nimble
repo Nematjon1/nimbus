@@ -9,15 +9,16 @@ skipDirs      = @["tests", "examples"]
 # we can't have the result of a custom task in the "bin" var - https://github.com/nim-lang/nimble/issues/542
 # bin           = @["build/nimbus"]
 
-requires "nim >= 0.19",
-         "chronicles",
-         "nimcrypto",
-         "stint",
-         "json_rpc",
-         "chronos",
-         "bncurve",
-         "eth",
-         "std_shims"
+requires "nim >= 1.2.0",
+  "bncurve",
+  "chronicles",
+  "chronos",
+  "eth",
+  "json_rpc",
+  "libbacktrace",
+  "nimcrypto",
+  "stew",
+  "stint"
 
 proc buildBinary(name: string, srcDir = "./", params = "", lang = "c") =
   if not dirExists "build":
@@ -26,10 +27,11 @@ proc buildBinary(name: string, srcDir = "./", params = "", lang = "c") =
   var extra_params = params
   for i in 2..<paramCount():
     extra_params &= " " & paramStr(i)
-  exec "nim " & lang & " --out:./build/" & name & " " & extra_params & " " & srcDir & name & ".nim"
+  exec "nim " & lang & " --out:build/" & name & " " & extra_params & " " & srcDir & name & ".nim"
 
 proc test(name: string, lang = "c") =
-  buildBinary name, "tests/", "-r -d:release -d:chronicles_log_level=ERROR"
+  buildBinary name, "tests/", "-d:chronicles_log_level=ERROR"
+  exec "build/" & name
 
 task test, "Run tests":
   test "all_tests"
@@ -38,4 +40,3 @@ task test, "Run tests":
 
 task nimbus, "Build Nimbus":
   buildBinary "nimbus", "nimbus/", "-d:chronicles_log_level=TRACE"
-

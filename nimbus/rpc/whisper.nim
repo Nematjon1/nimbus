@@ -1,26 +1,18 @@
 import
-  json_rpc/rpcserver, rpc_types, hexstrings, tables, options, sequtils,
+  json_rpc/rpcserver, tables, options,
   eth/[common, rlp, keys, p2p], eth/p2p/rlpx_protocols/whisper_protocol,
-  nimcrypto/[sysrand, hmac, sha2, pbkdf2]
+  nimcrypto/[sysrand, hmac, sha2, pbkdf2],
+  rpc_types, hexstrings, key_storage, ../random_keys
 
-from byteutils import hexToSeqByte, hexToByteArray
+from stew/byteutils import hexToSeqByte, hexToByteArray
+
+template generateRandomID*(): string =
+  generateRandomID(getRNG()[])
 
 # Whisper RPC implemented mostly as in
 # https://github.com/ethereum/go-ethereum/wiki/Whisper-v6-RPC-API
 
-type
-  WhisperKeys* = ref object
-    asymKeys*: Table[string, KeyPair]
-    symKeys*: Table[string, SymKey]
-
-  KeyGenerationError = object of CatchableError
-
-proc newWhisperKeys*(): WhisperKeys =
-  new(result)
-  result.asymKeys = initTable[string, KeyPair]()
-  result.symKeys = initTable[string, SymKey]()
-
-proc setupWhisperRPC*(node: EthereumNode, keys: WhisperKeys, rpcsrv: RpcServer) =
+proc setupWhisperRPC*(node: EthereumNode, keys: KeyStorage, rpcsrv: RpcServer) =
 
   rpcsrv.rpc("shh_version") do() -> string:
     ## Returns string of the current whisper protocol version.
@@ -54,13 +46,9 @@ proc setupWhisperRPC*(node: EthereumNode, keys: WhisperKeys, rpcsrv: RpcServer) 
     ## pow: The new PoW requirement.
     ##
     ## Returns true on success and an error on failure.
-    # Note: If any of the `peer.powRequirement` calls fails, we do not care and
-    # don't see this as an error. Could move this to `setPowRequirement` if
-    # this is the general behaviour we want.
-    try:
-      waitFor node.setPowRequirement(pow)
-    except:
-      trace "setPowRequirement error occured"
+    # Note: `setPowRequirement` does not raise on failures of sending the update
+    # to the peers. Hence in theory this should not causes errors.
+    await node.setPowRequirement(pow)
     result = true
 
   # TODO: change string in to ENodeStr with extra checks
@@ -86,7 +74,7 @@ proc setupWhisperRPC*(node: EthereumNode, keys: WhisperKeys, rpcsrv: RpcServer) 
     ##
     ## Returns key identifier on success and an error on failure.
     result = generateRandomID().Identifier
-    keys.asymKeys.add(result.string, newKeyPair())
+    keys.asymKeys.add(result.string, randomKeyPair())
 
   rpcsrv.rpc("shh_addPrivateKey") do(key: PrivateKey) -> Identifier:
     ## Stores the key pair, and returns its ID.
@@ -96,8 +84,7 @@ proc setupWhisperRPC*(node: EthereumNode, keys: WhisperKeys, rpcsrv: RpcServer) 
     ## Returns key identifier on success and an error on failure.
     result = generateRandomID().Identifier
 
-    keys.asymKeys.add(result.string, KeyPair(seckey: key,
-                                             pubkey: key.getPublicKey()))
+    keys.asymKeys.add(result.string, key.toKeyPair())
 
   rpcsrv.rpc("shh_deleteKeyPair") do(id: Identifier) -> bool:
     ## Deletes the specifies key if it exists.
@@ -251,24 +238,32 @@ proc setupWhisperRPC*(node: EthereumNode, keys: WhisperKeys, rpcsrv: RpcServer) 
     # Check if there are Topics when symmetric key is used
     validateOptions(options.privateKeyID, options.symKeyID, options.topics)
 
-    var filter: Filter
+    var
+      src: Option[PublicKey]
+      privateKey: Option[PrivateKey]
+      symKey: Option[SymKey]
+      topics: seq[whisper_protocol.Topic]
+      powReq: float64
+      allowP2P: bool
+
+    src = options.sig
+
     if options.privateKeyID.isSome():
-      filter.privateKey = some(keys.asymKeys[options.privateKeyID.get().string].seckey)
+      privateKey = some(keys.asymKeys[options.privateKeyID.get().string].seckey)
 
     if options.symKeyID.isSome():
-      filter.symKey= some(keys.symKeys[options.symKeyID.get().string])
-
-    filter.src = options.sig
+      symKey= some(keys.symKeys[options.symKeyID.get().string])
 
     if options.minPow.isSome():
-      filter.powReq = options.minPow.get()
+      powReq = options.minPow.get()
 
     if options.topics.isSome():
-      filter.topics = options.topics.get()
+      topics = options.topics.get()
 
     if options.allowP2P.isSome():
-      filter.allowP2P = options.allowP2P.get()
+      allowP2P = options.allowP2P.get()
 
+    let filter = initFilter(src, privateKey, symKey, topics, powReq, allowP2P)
     result = node.subscribeFilter(filter).Identifier
 
   rpcsrv.rpc("shh_deleteMessageFilter") do(id: Identifier) -> bool:
@@ -290,22 +285,18 @@ proc setupWhisperRPC*(node: EthereumNode, keys: WhisperKeys, rpcsrv: RpcServer) 
     ## Returns array of messages on success and an error on failure.
     let messages = node.getFilterMessages(id.string)
     for msg in messages:
-      var filterMsg: WhisperFilterMessage
-
-      filterMsg.sig = msg.decoded.src
-      filterMsg.recipientPublicKey = msg.dst
-      filterMsg.ttl = msg.ttl
-      filterMsg.topic = msg.topic
-      filterMsg.timestamp = msg.timestamp
-      filterMsg.payload = msg.decoded.payload
-      # Note: whisper_protocol padding is an Option as there is the
-      # possibility of 0 padding in case of custom padding.
-      if msg.decoded.padding.isSome():
-        filterMsg.padding = msg.decoded.padding.get()
-      filterMsg.pow = msg.pow
-      filterMsg.hash = msg.hash
-
-      result.add(filterMsg)
+      result.add WhisperFilterMessage(
+        sig: msg.decoded.src,
+        recipientPublicKey: msg.dst,
+        ttl: msg.ttl,
+        topic: msg.topic,
+        timestamp: msg.timestamp,
+        payload: msg.decoded.payload,
+        # Note: whisper_protocol padding is an Option as there is the
+        # possibility of 0 padding in case of custom padding.
+        padding: msg.decoded.padding.get(@[]),
+        pow: msg.pow,
+        hash: msg.hash)
 
   rpcsrv.rpc("shh_post") do(message: WhisperPostMessage) -> bool:
     ## Creates a whisper message and injects it into the network for
@@ -323,7 +314,7 @@ proc setupWhisperRPC*(node: EthereumNode, keys: WhisperKeys, rpcsrv: RpcServer) 
       sigPrivKey: Option[PrivateKey]
       symKey: Option[SymKey]
       topic: whisper_protocol.Topic
-      padding: Option[Bytes]
+      padding: Option[seq[byte]]
       targetPeer: Option[NodeId]
 
     if message.sig.isSome():

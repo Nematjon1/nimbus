@@ -6,16 +6,21 @@
 # at your option. This file may not be copied, modified, or distributed except according to those terms.
 
 import
-  unittest, strformat, strutils, sequtils, tables, json, ospaths, times,
-  byteutils, ranges/typedranges, eth/[rlp, common], eth/trie/db,
-  ./test_helpers, ../nimbus/vm/interpreter,
-  ../nimbus/[constants, errors, vm_state, vm_types, utils],
-  ../nimbus/db/[db_chain, state_db]
+  unittest2, strformat, strutils, tables, json, os, times, sequtils,
+  stew/byteutils, eth/[rlp, common], eth/trie/db,
+  ./test_helpers, ./test_allowed_to_fail, ../nimbus/vm/interpreter,
+  ../nimbus/[constants, vm_state, vm_types, utils],
+  ../nimbus/db/[db_chain]
+
+func bytesToHex(x: openarray[byte]): string {.inline.} =
+  ## TODO: use seq[byte] for raw data and delete this proc
+  foldl(x, a & b.int.toHex(2).toLowerAscii, "0x")
 
 proc testFixture(fixtures: JsonNode, testStatusIMPL: var TestStatus)
 
-suite "vm json tests":
-  jsonTest("VMTests", testFixture)
+proc vmJsonMain*() =
+  suite "vm json tests":
+    jsonTest("VMTests", testFixture, skipVMTests)
 
 proc testFixture(fixtures: JsonNode, testStatusIMPL: var TestStatus) =
   var fixture: JsonNode
@@ -36,27 +41,27 @@ proc testFixture(fixtures: JsonNode, testStatusIMPL: var TestStatus) =
 
   var vmState = newBaseVMState(emptyRlpHash, header, newBaseChainDB(newMemoryDB()))
   let fexec = fixture["exec"]
-  var code: seq[byte]
   vmState.mutateStateDB:
     setupStateDB(fixture{"pre"}, db)
-    let address = fexec{"address"}.getStr.parseAddress
-    code = db.getCode(address).toSeq
 
-  code = fexec{"code"}.getStr.hexToSeqByte
+  vmState.setupTxContext(
+    origin = fexec{"origin"}.getStr.parseAddress,
+    gasPrice = fexec{"gasPrice"}.getHexadecimalInt
+  )
+
   let toAddress = fexec{"address"}.getStr.parseAddress
-  let message = newMessage(
-      to = toAddress,
-      sender = fexec{"caller"}.getStr.parseAddress,
-      value = cast[uint64](fexec{"value"}.getHexadecimalInt).u256, # Cast workaround for negative value
-      data = fexec{"data"}.getStr.hexToSeqByte,
-      code = code,
-      contractCreation = toAddress == ZERO_ADDRESS, # assume ZERO_ADDRESS is a contract creation
-      gas = fexec{"gas"}.getHexadecimalInt,
-      gasPrice = fexec{"gasPrice"}.getHexadecimalInt,
-      options = newMessageOptions(origin=fexec{"origin"}.getStr.parseAddress,
-                                  createAddress = toAddress))
+  let message = Message(
+    kind: if toAddress == ZERO_ADDRESS: evmcCreate else: evmcCall, # assume ZERO_ADDRESS is a contract creation
+    depth: 0,
+    gas: fexec{"gas"}.getHexadecimalInt,
+    sender: fexec{"caller"}.getStr.parseAddress,
+    contractAddress: toAddress,
+    codeAddress: toAddress,
+    value: cast[uint64](fexec{"value"}.getHexadecimalInt).u256, # Cast workaround for negative value
+    data: fexec{"data"}.getStr.hexToSeqByte
+    )
 
-  var computation = newBaseComputation(vmState, header.blockNumber, message)
+  var computation = newComputation(vmState, message)
   computation.executeOpcodes()
 
   if not fixture{"post"}.isNil:
@@ -75,16 +80,13 @@ proc testFixture(fixtures: JsonNode, testStatusIMPL: var TestStatus) =
       fail()
 
     let expectedOutput = fixture{"out"}.getStr
-    check(computation.outputHex == expectedOutput)
+    check(computation.output.bytesToHex == expectedOutput)
     let gasMeter = computation.gasMeter
 
     let expectedGasRemaining = fixture{"gas"}.getHexadecimalInt
     let actualGasRemaining = gasMeter.gasRemaining
     checkpoint(&"Remaining: {actualGasRemaining} - Expected: {expectedGasRemaining}")
-    check(actualGasRemaining == expectedGasRemaining or
-          computation.code.hasSStore() and
-            (actualGasRemaining > expectedGasRemaining and (actualGasRemaining - expectedGasRemaining) mod 15_000 == 0 or
-             expectedGasRemaining > actualGasRemaining and (expectedGasRemaining - actualGasRemaining) mod 15_000 == 0))
+    check(actualGasRemaining == expectedGasRemaining)
 
     if not fixture{"post"}.isNil:
       verifyStateDb(fixture{"post"}, computation.vmState.readOnlyStateDB)
@@ -93,3 +95,6 @@ proc testFixture(fixtures: JsonNode, testStatusIMPL: var TestStatus) =
     check(computation.isError)
     if not fixture{"pre"}.isNil:
       verifyStateDb(fixture{"pre"}, computation.vmState.readOnlyStateDB)
+
+when isMainModule:
+  vmJsonMain()

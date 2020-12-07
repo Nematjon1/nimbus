@@ -1,4 +1,4 @@
-import eth/trie/db, ranges
+import eth/trie/db
 
 type
   CaptureFlags* {.pure.} = enum
@@ -6,7 +6,6 @@ type
     PersistDel
 
   DB = TrieDatabaseRef
-  BytesRange = Range[byte]
 
   CaptureDB* = ref object of RootObj
     srcDb: DB

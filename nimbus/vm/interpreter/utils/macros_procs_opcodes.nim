@@ -11,9 +11,12 @@
 import
   macros, strformat, stint, eth/common,
   ../../computation, ../../stack, ../../code_stream,
-  ../../../constants, ../../../vm_types, ../../memory,
-  ../../../errors, ../../message, ../../interpreter/[gas_meter, opcode_values],
+  ../../../vm_types, ../../memory,
+  ../../../errors, ../../interpreter/[gas_meter, opcode_values],
   ../../interpreter/utils/utils_numeric
+
+when defined(evmc_enabled):
+  import ../../evmc_api, evmc/evmc
 
 proc pop(tree: var NimNode): NimNode =
   ## Returns the last value of a NimNode and remove it
@@ -31,7 +34,7 @@ macro op*(procname: untyped, inline: static[bool], stackParams_body: varargs[unt
   # we can't have a nicer macro signature `stackParams: varargs[untyped], body: untyped`
   # see https://github.com/nim-lang/Nim/issues/5855 and are forced to "pop"
 
-  let computation = newIdentNode("computation")
+  let computation = newIdentNode("c")
   var stackParams = stackParams_body
 
   # 1. Separate stackParams and body with pop
@@ -43,7 +46,7 @@ macro op*(procname: untyped, inline: static[bool], stackParams_body: varargs[unt
 
   if len != 0:
     for params in stackParams:
-      popStackStmt.add newIdentNode(params.ident)
+      popStackStmt.add newIdentNode(params.strVal)
 
     popStackStmt.add newEmptyNode()
     popStackStmt.add quote do:
@@ -59,12 +62,12 @@ macro op*(procname: untyped, inline: static[bool], stackParams_body: varargs[unt
   # TODO: replace by func to ensure no side effects
   if inline:
     result = quote do:
-      proc `procname`*(`computation`: BaseComputation) {.inline.} =
+      proc `procname`*(`computation`: Computation) {.inline.} =
         `popStackStmt`
         `body`
   else:
     result = quote do:
-      proc `procname`*(`computation`: BaseComputation) {.gcsafe.} =
+      proc `procname`*(`computation`: Computation) {.gcsafe.} =
         `popStackStmt`
         `body`
 
@@ -76,7 +79,7 @@ macro genPush*(): untyped =
   for size in 1 .. 32:
     let name = genName(size)
     result.add quote do:
-      func `name`*(computation: BaseComputation) {.inline.}=
+      func `name`*(computation: Computation) {.inline.}=
         ## Push `size`-byte(s) on the stack
         computation.stack.push computation.code.readVmWord(`size`)
 
@@ -87,7 +90,7 @@ macro genDup*(): untyped =
   for pos in 1 .. 16:
     let name = genName(pos)
     result.add quote do:
-      func `name`*(computation: BaseComputation) {.inline.}=
+      func `name`*(computation: Computation) {.inline.}=
         computation.stack.dup(`pos`)
 
 macro genSwap*(): untyped =
@@ -97,16 +100,16 @@ macro genSwap*(): untyped =
   for pos in 1 .. 16:
     let name = genName(pos)
     result.add quote do:
-      func `name`*(computation: BaseComputation) {.inline.}=
+      func `name`*(computation: Computation) {.inline.}=
         computation.stack.swap(`pos`)
 
-template checkInStaticContext*(comp: BaseComputation) =
+template checkInStaticContext*(comp: Computation) =
   # TODO: if possible, this check only appear
   # when fork >= FkByzantium
   if emvcStatic == comp.msg.flags:
     raise newException(StaticContextError, "Cannot modify state while inside of a STATICCALL context")
 
-proc logImpl(c: BaseComputation, opcode: Op, topicCount: int) =
+proc logImpl(c: Computation, opcode: Op, topicCount: int) =
   doAssert(topicCount in 0 .. 4)
   checkInStaticContext(c)
   let (memStartPosition, size) = c.stack.popInt(2)
@@ -115,22 +118,32 @@ proc logImpl(c: BaseComputation, opcode: Op, topicCount: int) =
   if memPos < 0 or len < 0:
     raise newException(OutOfBoundsRead, "Out of bounds memory access")
 
-  var log: Log
-  log.topics = newSeqOfCap[Topic](topicCount)
-  for i in 0 ..< topicCount:
-    log.topics.add(c.stack.popTopic())
   c.gasMeter.consumeGas(
     c.gasCosts[opcode].m_handler(c.memory.len, memPos, len),
     reason="Memory expansion, Log topic and data gas cost")
-
   c.memory.extend(memPos, len)
-  log.data = c.memory.read(memPos, len)
-  log.address = c.msg.storageAddress
-  c.addLogEntry(log)
+
+  when evmc_enabled:
+    var topics: array[4, evmc_bytes32]
+    for i in 0 ..< topicCount:
+      topics[i].bytes = c.stack.popTopic()
+
+    c.host.emitLog(c.msg.contractAddress,
+      c.memory.read(memPos, len),
+      topics[0].addr, topicCount)
+  else:
+    var log: Log
+    log.topics = newSeqOfCap[Topic](topicCount)
+    for i in 0 ..< topicCount:
+      log.topics.add(c.stack.popTopic())
+
+    log.data = c.memory.read(memPos, len)
+    log.address = c.msg.contractAddress
+    c.addLogEntry(log)
 
 template genLog*() =
-  proc log0*(c: BaseComputation) {.inline.} = logImpl(c, Log0, 0)
-  proc log1*(c: BaseComputation) {.inline.} = logImpl(c, Log1, 1)
-  proc log2*(c: BaseComputation) {.inline.} = logImpl(c, Log2, 2)
-  proc log3*(c: BaseComputation) {.inline.} = logImpl(c, Log3, 3)
-  proc log4*(c: BaseComputation) {.inline.} = logImpl(c, Log4, 4)
+  proc log0*(c: Computation) {.inline.} = logImpl(c, Log0, 0)
+  proc log1*(c: Computation) {.inline.} = logImpl(c, Log1, 1)
+  proc log2*(c: Computation) {.inline.} = logImpl(c, Log2, 2)
+  proc log3*(c: Computation) {.inline.} = logImpl(c, Log3, 3)
+  proc log4*(c: Computation) {.inline.} = logImpl(c, Log4, 4)

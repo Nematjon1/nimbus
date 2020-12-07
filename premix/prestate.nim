@@ -1,7 +1,7 @@
 import
-  json, downloader, stint, eth/trie/db, byteutils,
+  json, stint, eth/trie/db, stew/byteutils,
   ../nimbus/db/[db_chain, storage_types], eth/[rlp, common],
-  ../nimbus/p2p/chain, ../nimbus/tracer
+  ../nimbus/tracer
 
 proc generatePrestate*(nimbus, geth: JsonNode, blockNumber: Uint256, parent, header: BlockHeader, body: BlockBody) =
   let
@@ -13,7 +13,7 @@ proc generatePrestate*(nimbus, geth: JsonNode, blockNumber: Uint256, parent, hea
     chainDB = newBaseChainDB(memoryDB, false)
 
   chainDB.setHead(parent, true)
-  chainDB.persistTransactions(blockNumber, body.transactions)
+  discard chainDB.persistTransactions(blockNumber, body.transactions)
   discard chainDB.persistUncles(body.uncles)
 
   memoryDB.put(genericHashKey(headerHash).toOpenArray, rlp.encode(header))

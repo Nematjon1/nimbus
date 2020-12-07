@@ -6,97 +6,91 @@
 # at your option. This file may not be copied, modified, or distributed except according to those terms.
 
 import
-  ranges/typedranges, sequtils, strformat, tables, options, sets,
-  eth/common, chronicles, ./db/[db_chain, state_db],
-  constants, errors, transaction, vm_types, vm_state, utils,
-  ./vm/[computation, interpreter], ./vm/interpreter/gas_costs
+  options, sets,
+  eth/common, chronicles, ./db/accounts_cache,
+  transaction, vm_types, vm_state,
+  ./vm/[computation, interpreter]
 
-proc validateTransaction*(vmState: BaseVMState, transaction: Transaction, sender: EthAddress): bool =
-  # XXX: https://github.com/status-im/nimbus/issues/35#issuecomment-391726518
-  # XXX: lots of avoidable u256 construction
-  let
-    account = vmState.readOnlyStateDB.getAccount(sender)
-    gasLimit = transaction.gasLimit.u256
-    limitAndValue = gasLimit + transaction.value
-    gasCost = gasLimit * transaction.gasPrice.u256
+proc validateTransaction*(vmState: BaseVMState, tx: Transaction, sender: EthAddress, fork: Fork): bool =
+  let balance = vmState.readOnlyStateDB.getBalance(sender)
+  let nonce = vmState.readOnlyStateDB.getNonce(sender)
 
-  transaction.gasLimit >= transaction.intrinsicGas and
-    #transaction.gasPrice <= (1 shl 34) and
-    limitAndValue <= account.balance and
-    transaction.accountNonce == account.nonce and
-    account.balance >= gasCost
-
-proc setupComputation*(vmState: BaseVMState, tx: Transaction, sender, recipient: EthAddress, fork: Fork) : BaseComputation =
-  var gas = tx.gasLimit - tx.intrinsicGas
-
-  # TODO: refactor message to use byterange
-  # instead of seq[byte]
-  var data, code: seq[byte]
-
-  if tx.isContractCreation:
-    gas = gas - gasFees[fork][GasTXCreate]
-    data = @[]
-    code = tx.payload
-  else:
-    data = tx.payload
-    code = vmState.readOnlyStateDB.getCode(tx.to).toSeq
-
-  if gas < 0:
-    debug "not enough gas to perform calculation", gas=gas
+  if vmState.cumulativeGasUsed + tx.gasLimit > vmState.blockHeader.gasLimit:
+    debug "invalid tx: block header gasLimit reached",
+      maxLimit=vmState.blockHeader.gasLimit,
+      gasUsed=vmState.cumulativeGasUsed,
+      addition=tx.gasLimit
     return
 
-  let msg = newMessage(
-    gas = gas,
-    gasPrice = tx.gasPrice,
-    to = tx.to,
-    sender = sender,
-    value = tx.value,
-    data = data,
-    code = code,
-    tx.isContractCreation,
-    options = newMessageOptions(origin = sender,
-                                createAddress = recipient))
+  let totalCost = tx.gasLimit.u256 * tx.gasPrice.u256 + tx.value
+  if totalCost > balance:
+    debug "invalid tx: not enough cash",
+      available=balance,
+      require=totalCost
+    return
 
-  result = newBaseComputation(vmState, vmState.blockNumber, msg, some(fork))
+  if tx.gasLimit < tx.intrinsicGas(fork):
+    debug "invalid tx: not enough gas to perform calculation",
+      available=tx.gasLimit,
+      require=tx.intrinsicGas(fork)
+    return
+
+  if tx.accountNonce != nonce:
+    debug "invalid tx: account nonce mismatch",
+      txNonce=tx.accountnonce,
+      accountNonce=nonce
+    return
+
+  result = true
+
+proc setupComputation*(vmState: BaseVMState, tx: Transaction, sender: EthAddress, fork: Fork) : Computation =
+  var gas = tx.gasLimit - tx.intrinsicGas(fork)
+  assert gas >= 0
+
+  vmState.setupTxContext(
+    origin = sender,
+    gasPrice = tx.gasPrice,
+    forkOverride = some(fork)
+  )
+
+  let msg = Message(
+    kind: if tx.isContractCreation: evmcCreate else: evmcCall,
+    depth: 0,
+    gas: gas,
+    sender: sender,
+    contractAddress: tx.getRecipient(),
+    codeAddress: tx.to,
+    value: tx.value,
+    data: tx.payload
+    )
+
+  result = newComputation(vmState, msg)
   doAssert result.isOriginComputation
 
-proc execComputation*(computation: var BaseComputation) =
-  if computation.msg.isCreate:
-    computation.applyMessage(Create)
+proc execComputation*(c: Computation) =
+  if c.msg.isCreate:
+    c.execCreate()
   else:
-    computation.applyMessage(Call)
+    c.vmState.mutateStateDB:
+      db.incNonce(c.msg.sender)
+    c.execCall()
 
-  computation.vmState.mutateStateDB:
-    var suicidedCount = 0
-    for deletedAccount in computation.accountsForDeletion:
-      db.deleteAccount deletedAccount
-      inc suicidedCount
+  if c.isSuccess:
+    c.refundSelfDestruct()
+    shallowCopy(c.vmState.suicides, c.suicides)
+    shallowCopy(c.vmState.logEntries, c.logEntries)
+    c.vmState.touchedAccounts.incl c.touchedAccounts
 
-    # FIXME: hook this into actual RefundSelfDestruct
-    const RefundSelfDestruct = 24_000
-    computation.gasMeter.refundGas(RefundSelfDestruct * suicidedCount)
+  c.vmstate.status = c.isSuccess
 
-  if computation.getFork >= FkSpurious:
-    computation.collectTouchedAccounts(computation.vmState.touchedAccounts)
-
-  computation.vmstate.status = computation.isSuccess
-  if computation.isSuccess:
-    computation.vmState.addLogs(computation.logEntries)
-
-proc refundGas*(computation: BaseComputation, tx: Transaction, sender: EthAddress): GasInt =
-  let
-    gasRemaining = computation.gasMeter.gasRemaining
-    gasRefunded = computation.getGasRefund()
-    gasUsed = tx.gasLimit - gasRemaining
-    gasRefund = min(gasRefunded, gasUsed div 2)
-
-  computation.vmState.mutateStateDB:
-    db.addBalance(sender, (gasRemaining + gasRefund).u256 * tx.gasPrice.u256)
-
-  result = gasUsed - gasRefund
+proc refundGas*(c: Computation, tx: Transaction, sender: EthAddress) =
+  let maxRefund = (tx.gasLimit - c.gasMeter.gasRemaining) div 2
+  c.gasMeter.returnGas min(c.getGasRefund(), maxRefund)
+  c.vmState.mutateStateDB:
+    db.addBalance(sender, c.gasMeter.gasRemaining.u256 * tx.gasPrice.u256)
 
 #[
-method executeTransaction(vmState: BaseVMState, transaction: Transaction): (BaseComputation, BlockHeader) {.base.}=
+method executeTransaction(vmState: BaseVMState, transaction: Transaction): (Computation, BlockHeader) {.base.}=
   # Execute the transaction in the vm
   # TODO: introduced here: https://github.com/ethereum/py-evm/commit/21c57f2d56ab91bb62723c3f9ebe291d0b132dde
   # Refactored/Removed here: https://github.com/ethereum/py-evm/commit/cc991bf
@@ -104,7 +98,7 @@ method executeTransaction(vmState: BaseVMState, transaction: Transaction): (Base
   raise newException(ValueError, "Must be implemented by subclasses")
 
 
-method addTransaction*(vmState: BaseVMState, transaction: Transaction, computation: BaseComputation, b: Block): (Block, Table[string, string]) =
+method addTransaction*(vmState: BaseVMState, transaction: Transaction, c: Computation, b: Block): (Block, Table[string, string]) =
   # Add a transaction to the given block and
   # return `trieData` to store the transaction data in chaindb in VM layer
   # Update the bloomFilter, transaction trie and receipt trie roots, bloom_filter,
@@ -137,7 +131,7 @@ method applyTransaction*(
     vmState: BaseVMState,
     transaction: Transaction,
     b: Block,
-    isStateless: bool): (BaseComputation, Block, Table[string, string]) =
+    isStateless: bool): (Computation, Block, Table[string, string]) =
   # Apply transaction to the given block
   # transaction: the transaction need to be applied
   # b: the block which the transaction applies on

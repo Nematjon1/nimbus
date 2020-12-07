@@ -1,7 +1,9 @@
 import
-  unittest, strformat, options, byteutils, json_rpc/[rpcserver, rpcclient],
-  eth/common as eth_common, eth/[rlp, keys], eth/p2p/rlpx_protocols/whisper_protocol,
-  ../nimbus/rpc/[common, hexstrings, rpc_types, whisper], ./test_helpers
+  unittest, strformat, options, stew/byteutils, json_rpc/[rpcserver, rpcclient],
+  eth/common as eth_common, eth/[rlp, keys],
+  eth/p2p/rlpx_protocols/whisper_protocol,
+  ../nimbus/rpc/[common, hexstrings, rpc_types, whisper, key_storage],
+  ./test_helpers
 
 from os import DirSep
 from strutils import rsplit
@@ -20,7 +22,7 @@ proc doTests {.async.} =
   var
     rpcServer = newRpcSocketServer(["localhost:" & $RPC_PORT])
     client = newRpcSocketClient()
-  let keys = newWhisperKeys()
+  let keys = newKeyStorage()
   setupWhisperRPC(ethNode, keys, rpcServer)
 
   # Begin tests
@@ -63,7 +65,7 @@ proc doTests {.async.} =
       let keyID2 = await client.shh_addPrivateKey(privkey)
       check:
         await(client.shh_getPublicKey(keyID2)) == pubkey.toPublicKey
-        await(client.shh_getPrivateKey(keyID2)) == privkey.toPrivateKey
+        await(client.shh_getPrivateKey(keyID2)).toRaw() == privkey.toPrivateKey.toRaw()
         await(client.shh_hasKeyPair(keyID2)) == true
         await(client.shh_deleteKeyPair(keyID2)) == true
         await(client.shh_hasKeyPair(keyID2)) == false

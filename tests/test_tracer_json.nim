@@ -6,14 +6,15 @@
 # at your option. This file may not be copied, modified, or distributed except according to those terms.
 
 import
-  unittest, json, os, tables, strformat, strutils,
-  eth/common, byteutils, eth/trie/db,
+  unittest2, json, os, tables, strutils,
+  eth/common, stew/byteutils, eth/trie/db,
   ./test_helpers, ../nimbus/db/db_chain, ../nimbus/[tracer, vm_types]
 
 proc testFixture(node: JsonNode, testStatusIMPL: var TestStatus)
 
-suite "tracer json tests":
-  jsonTest("TracerTests", testFixture)
+proc tracerJsonMain*() =
+  suite "tracer json tests":
+    jsonTest("TracerTests", testFixture)
 
 # use tracerTestGen.nim to generate additional test data
 proc testFixture(node: JsonNode, testStatusIMPL: var TestStatus) =
@@ -44,3 +45,6 @@ proc testFixture(node: JsonNode, testStatusIMPL: var TestStatus) =
     let receipt = receipts[i]
     let stateDiff = txTraces[i]["stateDiff"]
     check receipt["root"].getStr().toLowerAscii() == stateDiff["afterRoot"].getStr().toLowerAscii()
+
+when isMainModule:
+  tracerJsonMain()

@@ -8,7 +8,7 @@
 import
   sequtils,
   chronicles, eth/common/eth_types,
-  ../constants, ../errors, ../validation,
+  ../errors, ../validation,
   ./interpreter/utils/utils_numeric
 
 logScope:
@@ -24,7 +24,6 @@ proc newMemory*: Memory =
 
 proc len*(memory: Memory): int =
   result = memory.bytes.len
-
 
 proc extend*(memory: var Memory; startPos: Natural; size: Natural) =
   if size == 0:
@@ -43,6 +42,11 @@ proc read*(memory: var Memory, startPos: Natural, size: Natural): seq[byte] =
   # TODO: use an openarray[byte]
   result = memory.bytes[startPos ..< (startPos + size)]
 
+when defined(evmc_enabled):
+  proc readPtr*(memory: var Memory, startPos: Natural): ptr byte =
+    if memory.bytes.len == 0 or startPos > memory.bytes.len: return
+    result = memory.bytes[startPos].addr
+
 proc write*(memory: var Memory, startPos: Natural, value: openarray[byte]) =
   let size = value.len
   if size == 0:
@@ -50,7 +54,6 @@ proc write*(memory: var Memory, startPos: Natural, value: openarray[byte]) =
   #echo size
   #echo startPos
   validateLte(startPos + size, memory.len)
-  let index = memory.len
   if memory.len < startPos + size:
     memory.bytes = memory.bytes.concat(repeat(0.byte, memory.len - (startPos + size))) # TODO: better logarithmic scaling?
 

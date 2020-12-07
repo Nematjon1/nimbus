@@ -1,8 +1,8 @@
 import
   json, strutils, sets, hashes,
   chronicles, nimcrypto, eth/common, stint,
-  ../vm_types, memory, stack, ../db/[db_chain, state_db],
-  eth/trie/hexary, ./message, ranges/typedranges,
+  ../vm_types, memory, stack, ../db/accounts_cache,
+  eth/trie/hexary,
   ./interpreter/opcode_values
 
 logScope:
@@ -21,7 +21,7 @@ proc initTracer*(tracer: var TransactionTracer, flags: set[TracerFlags] = {}) =
 
   tracer.trace["structLogs"] = newJArray()
   tracer.flags = flags
-  tracer.accounts = initSet[EthAddress]()
+  tracer.accounts = initHashSet[EthAddress]()
   tracer.storageKeys = @[]
 
 proc prepare*(tracer: var TransactionTracer, compDepth: int) =
@@ -32,9 +32,9 @@ proc prepare*(tracer: var TransactionTracer, compDepth: int) =
     let prevLen = tracer.storageKeys.len
     tracer.storageKeys.setLen(compDepth + 1)
     for i in prevLen ..< tracer.storageKeys.len - 1:
-      tracer.storageKeys[i] = initSet[Uint256]()
+      tracer.storageKeys[i] = initHashSet[Uint256]()
 
-  tracer.storageKeys[compDepth] = initSet[Uint256]()
+  tracer.storageKeys[compDepth] = initHashSet[Uint256]()
 
 proc rememberStorageKey(tracer: var TransactionTracer, compDepth: int, key: Uint256) =
   tracer.storageKeys[compDepth].incl key
@@ -44,7 +44,7 @@ iterator storage(tracer: TransactionTracer, compDepth: int): Uint256 =
   for key in tracer.storageKeys[compDepth]:
     yield key
 
-proc traceOpCodeStarted*(tracer: var TransactionTracer, c: BaseComputation, op: Op): int =
+proc traceOpCodeStarted*(tracer: var TransactionTracer, c: Computation, op: Op): int =
   if unlikely tracer.trace.isNil:
     tracer.initTracer()
 
@@ -90,7 +90,7 @@ proc traceOpCodeStarted*(tracer: var TransactionTracer, c: BaseComputation, op: 
 
   result = tracer.trace["structLogs"].len - 1
 
-proc traceOpCodeEnded*(tracer: var TransactionTracer, c: BaseComputation, op: Op, lastIndex: int) =
+proc traceOpCodeEnded*(tracer: var TransactionTracer, c: Computation, op: Op, lastIndex: int) =
   let j = tracer.trace["structLogs"].elems[lastIndex]
 
   # TODO: figure out how to get storage
@@ -100,21 +100,21 @@ proc traceOpCodeEnded*(tracer: var TransactionTracer, c: BaseComputation, op: Op
     if c.msg.depth < tracer.storageKeys.len:
       var stateDB = c.vmState.accountDb
       for key in tracer.storage(c.msg.depth):
-        let (value, _) = stateDB.getStorage(c.msg.storageAddress, key)
+        let value = stateDB.getStorage(c.msg.contractAddress, key)
         storage[key.dumpHex] = %(value.dumpHex)
       j["storage"] = storage
 
-  let gasRemaining = j["gas"].getInt()
+  let gasRemaining = j["gas"].getBiggestInt()
   j["gasCost"] = %(gasRemaining - c.gasMeter.gasRemaining)
 
   if op in {Return, Revert}:
-    let returnValue = %("0x" & toHex(c.rawOutput, true))
+    let returnValue = %("0x" & toHex(c.output, true))
     j["returnValue"] = returnValue
     tracer.trace["returnValue"] = returnValue
 
   trace "Op", json = j.pretty()
 
-proc traceError*(tracer: var TransactionTracer, c: BaseComputation) =
+proc traceError*(tracer: var TransactionTracer, c: Computation) =
   if tracer.trace["structLogs"].elems.len > 0:
     let j = tracer.trace["structLogs"].elems[^1]
     j["error"] = %(c.error.info)
@@ -123,7 +123,7 @@ proc traceError*(tracer: var TransactionTracer, c: BaseComputation) =
     # even though the gasCost is incorrect,
     # we have something to display,
     # it is an error anyway
-    let gasRemaining = j["gas"].getInt()
+    let gasRemaining = j["gas"].getBiggestInt()
     j["gasCost"] = %(gasRemaining - c.gasMeter.gasRemaining)
 
   tracer.trace["failed"] = %true

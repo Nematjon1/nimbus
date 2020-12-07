@@ -6,7 +6,7 @@
 # at your option. This file may not be copied, modified, or distributed except according to those terms.
 
 import
-  unittest, macros, strformat,
+  unittest2, macros, strformat,
   eth/common/eth_types,
   ../nimbus/[vm_types, errors, vm/interpreter]
 
@@ -22,9 +22,11 @@ proc gasMeters: seq[GasMeter] =
 
 macro all(element: untyped, handler: untyped): untyped =
   let name = ident(&"{element.repr}s")
+  let StartGas = ident("StartGas")
   result = quote:
     var res = `name`()
     for `element` in res.mitems:
+      let `StartGas` = `element`.gasRemaining
       `handler`
 
 # @pytest.mark.parametrize("value", (0, 10))
@@ -57,45 +59,48 @@ macro all(element: untyped, handler: untyped): untyped =
 #     gas_meter.refund_gas(amount)
 #     doAssert gas_meter.gas_refunded == amount
 
+proc gasMeterMain*() =
+  suite "gasMeter":
+    # types
+    # test "consume rejects negative":
+    #   all(gasMeter):
+    #     expect(ValidationError):
+    #       gasMeter.consumeGas(-1.i256, "independent")
 
-suite "gasMeter":
-  # types
-  # test "consume rejects negative":
-  #   all(gasMeter):
-  #     expect(ValidationError):
-  #       gasMeter.consumeGas(-1.i256, "independent")
+    # test "return rejects negative":
+    #   all(gasMeter):
+    #     expect(ValidationError):
+    #       gasMeter.returnGas(-1.i256)
 
-  # test "return rejects negative":
-  #   all(gasMeter):
-  #     expect(ValidationError):
-  #       gasMeter.returnGas(-1.i256)
+    # test "refund rejects negative":
+    #   all(gasMeter):
+    #     expect(ValidationError):
+    #       gasMeter.returnGas(-1.i256)
 
-  # test "refund rejects negative":
-  #   all(gasMeter):
-  #     expect(ValidationError):
-  #       gasMeter.returnGas(-1.i256)
+    # TODO: -0/+0
+    test "consume spends":
+      all(gasMeter):
+        check(gasMeter.gasRemaining == StartGas)
+        let consume = StartGas
+        gasMeter.consumeGas(consume, "0")
+        check(gasMeter.gasRemaining - (StartGas - consume) == 0)
 
-  # TODO: -0/+0
-  test "consume spends":
-    all(gasMeter):
-      check(gasMeter.gasRemaining == gasMeter.startGas)
-      let consume = gasMeter.startGas
-      gasMeter.consumeGas(consume, "0")
-      check(gasMeter.gasRemaining - (gasMeter.startGas - consume) == 0)
+    test "consume errors":
+      all(gasMeter):
+        check(gasMeter.gasRemaining == StartGas)
+        expect(OutOfGas):
+          gasMeter.consumeGas(StartGas + 1, "")
 
-  test "consume errors":
-    all(gasMeter):
-      check(gasMeter.gasRemaining == gasMeter.startGas)
-      expect(OutOfGas):
-        gasMeter.consumeGas(gasMeter.startGas + 1, "")
+    test "return refund works correctly":
+      all(gasMeter):
+        check(gasMeter.gasRemaining == StartGas)
+        check(gasMeter.gasRefunded == 0)
+        gasMeter.consumeGas(5, "")
+        check(gasMeter.gasRemaining == StartGas - 5)
+        gasMeter.returnGas(5)
+        check(gasMeter.gasRemaining == StartGas)
+        gasMeter.refundGas(5)
+        check(gasMeter.gasRefunded == 5)
 
-  test "return refund works correctly":
-    all(gasMeter):
-      check(gasMeter.gasRemaining == gasMeter.startGas)
-      check(gasMeter.gasRefunded == 0)
-      gasMeter.consumeGas(5, "")
-      check(gasMeter.gasRemaining == gasMeter.startGas - 5)
-      gasMeter.returnGas(5)
-      check(gasMeter.gasRemaining == gasMeter.startGas)
-      gasMeter.refundGas(5)
-      check(gasMeter.gasRefunded == 5)
+when isMainModule:
+  gasMeterMain()

@@ -1,7 +1,7 @@
 import
-  json, os, eth/common, stint, chronicles, byteutils, nimcrypto, eth/rlp,
-  eth/trie/db, ../nimbus/db/[db_chain, capturedb, storage_types, select_backend],
-  ../nimbus/[tracer, vm_types, config],
+  json, eth/common, stint, chronicles, eth/rlp,
+  eth/trie/db, ../nimbus/db/[db_chain, capturedb, select_backend],
+  ../nimbus/[tracer, config],
   ../nimbus/p2p/chain
 
 proc dumpTest(chainDB: BaseChainDB, blockNumber: int) =
@@ -34,7 +34,7 @@ proc dumpTest(chainDB: BaseChainDB, blockNumber: int) =
   metaData.dumpMemoryDB(memoryDB)
   writeFile("block" & $blockNumber & ".json", metaData.pretty())
 
-proc main() =
+proc main() {.used.} =
   # 97 block with uncles
   # 46147 block with first transaction
   # 46400 block with transaction
@@ -83,12 +83,13 @@ proc main() =
   chainDB.dumpTest(47216)   # regression
   chainDB.dumpTest(652148)  # contract transfer bug
   chainDB.dumpTest(668910)  # uncleared logs bug
-  chainDB.dumpTest(1017395) # sha256 and ripemd precompiles wordcount bug
-  chainDB.dumpTest(1149150) # need to swallow precompiles errors
-  chainDB.dumpTest(1155095) # homestead codeCost OOG
-  chainDB.dumpTest(1317742) # CREATE childmsg sender
-  chainDB.dumpTest(1368834) # writepadded regression padding len
-  chainDB.dumpTest(1417555) # writepadded regression zero len
+  chainDB.dumpTest(1_017_395) # sha256 and ripemd precompiles wordcount bug
+  chainDB.dumpTest(1_149_150) # need to swallow precompiles errors
+  chainDB.dumpTest(1_155_095) # homestead codeCost OOG
+  chainDB.dumpTest(1_317_742) # CREATE childmsg sender
+  chainDB.dumpTest(1_352_922) # first ecrecover precompile with 0x0 input
+  chainDB.dumpTest(1_368_834) # writepadded regression padding len
+  chainDB.dumpTest(1_417_555) # writepadded regression zero len
   chainDB.dumpTest(1_431_916) # deep recursion stack overflow problem
   chainDB.dumpTest(1_487_668) # getScore uint64 vs uint256 overflow
   chainDB.dumpTest(1_920_000) # the DAO fork

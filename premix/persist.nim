@@ -1,14 +1,14 @@
 # use this module to quickly populate db with data from geth/parity
 
 import
-  eth/[common, rlp], stint, byteutils, nimcrypto,
+  eth/[common, rlp], stint,
   chronicles, downloader, configuration,
   ../nimbus/errors
 
 import
-  eth/trie/[hexary, db, trie_defs],
+  eth/trie/[hexary, db],
   ../nimbus/db/[storage_types, db_chain, select_backend],
-  ../nimbus/[genesis, utils],
+  ../nimbus/[genesis],
   ../nimbus/p2p/chain
 
 const
@@ -21,7 +21,7 @@ template persistToDb(db: ChainDB, body: untyped) =
   when manualCommit:
     if not db.txCommit(): doAssert(false)
 
-proc main() =
+proc main() {.used.} =
   # 97 block with uncles
   # 46147 block with first transaction
   # 46400 block with transaction
@@ -34,10 +34,10 @@ proc main() =
   # 52029 first block with receipts logs
   # 66407 failed transaction
 
-  let conf = getConfiguration()
+  let conf = configuration.getConfiguration()
   let db = newChainDb(conf.dataDir)
   let trieDB = trieDB db
-  let chainDB = newBaseChainDB(trieDB, false)
+  let chainDB = newBaseChainDB(trieDB, false, conf.netId)
 
   # move head to block number ...
   if conf.head != 0.u256:
@@ -62,13 +62,13 @@ proc main() =
   var numBlocks = 0
   var counter = 0
 
-  while true:    
+  while true:
     var thisBlock = requestBlock(blockNumber)
 
     headers.add thisBlock.header
     bodies.add thisBlock.body
     info "REQUEST HEADER", blockNumber=blockNumber, txs=thisBlock.body.transactions.len
-    
+
     inc numBlocks
     blockNumber += one
 
@@ -93,7 +93,7 @@ when isMainModule:
   var message: string
 
   ## Processing command line arguments
-  if processArguments(message) != Success:
+  if configuration.processArguments(message) != Success:
     echo message
     quit(QuitFailure)
   else:

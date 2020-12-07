@@ -6,328 +6,344 @@
 # at your option. This file may not be copied, modified, or distributed except according to those terms.
 
 import
-  chronicles, strformat, strutils, sequtils, macros, terminal, math, tables, options,
-  sets, eth/[common, keys], eth/trie/db as triedb,
-  ../constants, ../errors, ../validation, ../vm_state, ../vm_types,
+  chronicles, strformat, macros, options, times,
+  sets, eth/[common, keys],
+  ../constants, ../errors, ../vm_state, ../vm_types,
   ./interpreter/[opcode_values, gas_meter, gas_costs, vm_forks],
-  ./code_stream, ./memory, ./message, ./stack, ../db/[state_db, db_chain],
-  ../utils/header, byteutils, ranges, precompiles,
-  transaction_tracer, eth/trie/trie_defs
+  ./code_stream, ./memory, ./message, ./stack, ../db/[accounts_cache, db_chain],
+  ../utils/header, precompiles,
+  transaction_tracer, ../utils
+
+when defined(chronicles_log_level):
+  import stew/byteutils
+
+when defined(evmc_enabled):
+  import evmc/evmc, evmc_helpers, evmc_api, stew/ranges/ptr_arith
 
 logScope:
   topics = "vm computation"
 
-proc newBaseComputation*(vmState: BaseVMState, blockNumber: UInt256, message: Message, forkOverride=none(Fork)): BaseComputation =
+const
+  evmc_enabled* = defined(evmc_enabled)
+
+template getCoinbase*(c: Computation): EthAddress =
+  when evmc_enabled:
+    c.host.getTxContext().block_coinbase
+  else:
+    c.vmState.coinbase
+
+template getTimestamp*(c: Computation): int64 =
+  when evmc_enabled:
+    c.host.getTxContext().block_timestamp
+  else:
+    c.vmState.timestamp.toUnix
+
+template getBlockNumber*(c: Computation): Uint256 =
+  when evmc_enabled:
+    c.host.getTxContext().block_number.u256
+  else:
+    c.vmState.blockNumber.blockNumberToVmWord
+
+template getDifficulty*(c: Computation): DifficultyInt =
+  when evmc_enabled:
+    Uint256.fromEvmc c.host.getTxContext().block_difficulty
+  else:
+    c.vmState.difficulty
+
+template getGasLimit*(c: Computation): GasInt =
+  when evmc_enabled:
+    c.host.getTxContext().block_gas_limit.GasInt
+  else:
+    c.vmState.gasLimit
+
+template getChainId*(c: Computation): uint =
+  when evmc_enabled:
+    Uint256.fromEvmc(c.host.getTxContext().chain_id).truncate(uint)
+  else:
+    c.vmState.chaindb.config.chainId
+
+template getOrigin*(c: Computation): EthAddress =
+  when evmc_enabled:
+    c.host.getTxContext().tx_origin
+  else:
+    c.vmState.txOrigin
+
+template getGasPrice*(c: Computation): GasInt =
+  when evmc_enabled:
+    Uint256.fromEvmc(c.host.getTxContext().tx_gas_price).truncate(GasInt)
+  else:
+    c.vmState.txGasPrice
+
+template getBlockHash*(c: Computation, blockNumber: Uint256): Hash256 =
+  when evmc_enabled:
+    c.host.getBlockHash(blockNumber)
+  else:
+    c.vmState.getAncestorHash(blockNumber.vmWordToBlockNumber)
+
+template accountExists*(c: Computation, address: EthAddress): bool =
+  when evmc_enabled:
+    c.host.accountExists(address)
+  else:
+    if c.fork >= FkSpurious:
+      not c.vmState.readOnlyStateDB.isDeadAccount(address)
+    else:
+      c.vmState.readOnlyStateDB.accountExists(address)
+
+template getStorage*(c: Computation, slot: Uint256): Uint256 =
+  when evmc_enabled:
+    c.host.getStorage(c.msg.contractAddress, slot)
+  else:
+    c.vmState.readOnlyStateDB.getStorage(c.msg.contractAddress, slot)
+
+template getBalance*(c: Computation, address: EthAddress): Uint256 =
+  when evmc_enabled:
+    c.host.getBalance(address)
+  else:
+    c.vmState.readOnlyStateDB.getBalance(address)
+
+template getCodeSize*(c: Computation, address: EthAddress): uint =
+  when evmc_enabled:
+    c.host.getCodeSize(address)
+  else:
+    uint(c.vmState.readOnlyStateDB.getCodeSize(address))
+
+template getCodeHash*(c: Computation, address: EthAddress): Hash256 =
+  when evmc_enabled:
+    c.host.getCodeHash(address)
+  else:
+    let db = c.vmState.readOnlyStateDB
+    if not db.accountExists(address) or db.isEmptyAccount(address):
+      default(Hash256)
+    else:
+      db.getCodeHash(address)
+
+template selfDestruct*(c: Computation, address: EthAddress) =
+  when evmc_enabled:
+    c.host.selfDestruct(c.msg.contractAddress, address)
+  else:
+    c.execSelfDestruct(address)
+
+template getCode*(c: Computation, address: EthAddress): seq[byte] =
+  when evmc_enabled:
+    c.host.copyCode(address)
+  else:
+    c.vmState.readOnlyStateDB.getCode(address)
+
+proc generateContractAddress(c: Computation, salt: Uint256): EthAddress =
+  if c.msg.kind == evmcCreate:
+    let creationNonce = c.vmState.readOnlyStateDb().getNonce(c.msg.sender)
+    result = generateAddress(c.msg.sender, creationNonce)
+  else:
+    result = generateSafeAddress(c.msg.sender, salt, c.msg.data)
+
+import stew/byteutils
+
+proc newComputation*(vmState: BaseVMState, message: Message, salt= 0.u256): Computation =
   new result
   result.vmState = vmState
   result.msg = message
   result.memory = Memory()
   result.stack = newStack()
+  result.returnStack = @[]
   result.gasMeter.init(message.gas)
-  result.children = @[]
-  result.accountsToDelete = initTable[EthAddress, EthAddress]()
-  result.code = newCodeStream(message.code)
-  # result.rawOutput = "0x"
-  result.gasCosts =
-    if forkOverride.isSome:
-      forkOverride.get.forkToSchedule
-    else:
-      blockNumber.toFork.forkToSchedule
-  result.forkOverride = forkOverride
-  # a dummy/terminus continuation proc
-  result.nextProc = proc() =
-    discard
+  result.touchedAccounts = initHashSet[EthAddress]()
+  result.suicides = initHashSet[EthAddress]()
 
-proc isOriginComputation*(c: BaseComputation): bool =
+  if result.msg.isCreate():
+    result.msg.contractAddress = result.generateContractAddress(salt)
+    result.code = newCodeStream(message.data)
+    message.data = @[]
+  else:
+    result.code = newCodeStream(vmState.readOnlyStateDb.getCode(message.codeAddress))
+
+  when evmc_enabled:
+    result.host.init(
+      nim_host_get_interface(),
+      cast[evmc_host_context](result)
+    )
+
+template gasCosts*(c: Computation): untyped =
+  c.vmState.gasCosts
+
+template fork*(c: Computation): untyped =
+  c.vmState.fork
+
+proc isOriginComputation*(c: Computation): bool =
   # Is this computation the computation initiated by a transaction
-  c.msg.isOrigin
+  c.msg.sender == c.vmState.txOrigin
 
-template isSuccess*(c: BaseComputation): bool =
+template isSuccess*(c: Computation): bool =
   c.error.isNil
 
-template isError*(c: BaseComputation): bool =
+template isError*(c: Computation): bool =
   not c.isSuccess
 
-func shouldBurnGas*(c: BaseComputation): bool =
+func shouldBurnGas*(c: Computation): bool =
   c.isError and c.error.burnsGas
 
-func shouldEraseReturnData*(c: BaseComputation): bool =
-  c.isError and c.error.erasesReturnData
+proc isSuicided*(c: Computation, address: EthAddress): bool =
+  result = address in c.suicides
 
-func bytesToHex(x: openarray[byte]): string {.inline.} =
-  ## TODO: use seq[byte] for raw data and delete this proc
-  foldl(x, a & b.int.toHex(2).toLowerAscii, "0x")
+proc snapshot*(c: Computation) =
+  c.savePoint = c.vmState.accountDb.beginSavePoint()
 
-func output*(c: BaseComputation): seq[byte] =
-  if c.shouldEraseReturnData:
-    @[]
-  else:
-    c.rawOutput
+proc commit*(c: Computation) =
+  c.vmState.accountDb.commit(c.savePoint)
 
-func `output=`*(c: BaseComputation, value: openarray[byte]) =
-  c.rawOutput = @value
+proc dispose*(c: Computation) {.inline.} =
+  c.vmState.accountDb.dispose(c.savePoint)
 
-proc outputHex*(c: BaseComputation): string =
-  if c.shouldEraseReturnData:
-    return "0x"
-  c.rawOutput.bytesToHex
+proc rollback*(c: Computation) =
+  c.vmState.accountDb.rollback(c.savePoint)
 
-proc isSuicided*(c: BaseComputation, address: EthAddress): bool =
-  result = address in c.accountsToDelete
+proc setError*(c: Computation, msg: string, burnsGas = false) {.inline.} =
+  c.error = Error(info: msg, burnsGas: burnsGas)
 
-proc prepareChildMessage*(
-    c: BaseComputation,
-    gas: GasInt,
-    to: EthAddress,
-    value: UInt256,
-    data: seq[byte],
-    code: seq[byte],
-    contractCreation: bool,
-    options: MessageOptions = newMessageOptions()): Message =
-
-  var childOptions = options
-  childOptions.depth = c.msg.depth + 1
-  result = newMessage(
-    gas,
-    c.msg.gasPrice,
-    to,
-    c.msg.origin,
-    value,
-    data,
-    code,
-    contractCreation,
-    childOptions)
-
-proc snapshot*(comp: BaseComputation) =
-  comp.dbsnapshot.transaction = comp.vmState.chaindb.db.beginTransaction()
-  comp.dbsnapshot.intermediateRoot = comp.vmState.accountDb.rootHash
-  comp.vmState.blockHeader.stateRoot = comp.vmState.accountDb.rootHash
-
-proc commit*(comp: BaseComputation) =
-  comp.dbsnapshot.transaction.commit()
-  comp.vmState.accountDb.rootHash = comp.vmState.blockHeader.stateRoot
-
-proc dispose*(comp: BaseComputation) {.inline.} =
-  comp.dbsnapshot.transaction.dispose()
-
-proc rollback*(comp: BaseComputation) =
-  comp.dbsnapshot.transaction.rollback()
-  comp.vmState.accountDb.rootHash = comp.dbsnapshot.intermediateRoot
-  comp.vmState.blockHeader.stateRoot = comp.dbsnapshot.intermediateRoot
-
-proc setError*(comp: BaseComputation, msg: string, burnsGas = false) {.inline.} =
-  comp.error = Error(info: msg, burnsGas: burnsGas)
-
-proc getFork*(computation: BaseComputation): Fork =
-  result =
-    if computation.forkOverride.isSome:
-      computation.forkOverride.get
-    else:
-      computation.vmState.blockNumber.toFork
-
-proc writeContract*(computation: BaseComputation, fork: Fork): bool {.gcsafe.} =
+proc writeContract*(c: Computation, fork: Fork): bool {.gcsafe.} =
   result = true
 
-  let contractCode = computation.output
+  let contractCode = c.output
   if contractCode.len == 0: return
 
   if fork >= FkSpurious and contractCode.len >= EIP170_CODE_SIZE_LIMIT:
     debug "Contract code size exceeds EIP170", limit=EIP170_CODE_SIZE_LIMIT, actual=contractCode.len
     return false
 
-  let storageAddr = computation.msg.storageAddress
-  if computation.isSuicided(storageAddr): return
+  let storageAddr = c.msg.contractAddress
+  if c.isSuicided(storageAddr): return
 
   let gasParams = GasParams(kind: Create, cr_memLength: contractCode.len)
-  let codeCost = computation.gasCosts[Create].c_handler(0.u256, gasParams).gasCost
-  if computation.gasMeter.gasRemaining >= codeCost:
-    computation.gasMeter.consumeGas(codeCost, reason = "Write contract code for CREATE")
-    computation.vmState.mutateStateDb:
-      db.setCode(storageAddr, contractCode.toRange)
+  let codeCost = c.gasCosts[Create].c_handler(0.u256, gasParams).gasCost
+  if c.gasMeter.gasRemaining >= codeCost:
+    c.gasMeter.consumeGas(codeCost, reason = "Write contract code for CREATE")
+    c.vmState.mutateStateDb:
+      db.setCode(storageAddr, contractCode)
     result = true
   else:
-    if fork < FkHomestead or fork >= FkByzantium: computation.output = @[]
+    if fork < FkHomestead or fork >= FkByzantium: c.output = @[]
     result = false
 
-proc transferBalance(computation: BaseComputation, opCode: static[Op]) =
-  let senderBalance = computation.vmState.readOnlyStateDb().
-                      getBalance(computation.msg.sender)
+proc initAddress(x: int): EthAddress {.compileTime.} = result[19] = x.byte
+const ripemdAddr = initAddress(3)
+proc executeOpcodes*(c: Computation) {.gcsafe.}
 
-  if senderBalance < computation.msg.value:
-    computation.setError(&"insufficient funds available={senderBalance}, needed={computation.msg.value}")
-    return
-
-  when opCode in {Call, Create}:
-    computation.vmState.mutateStateDb:
-      db.subBalance(computation.msg.sender, computation.msg.value)
-      db.addBalance(computation.msg.storageAddress, computation.msg.value)
-
-template continuation*(comp: BaseComputation, body: untyped) =
-  # this is a helper template to implement continuation
-  # passing and convert all recursion into tail call
-  var tmpNext = comp.nextProc
-  comp.nextProc = proc() {.gcsafe.} =
-    body
-    tmpNext()
-
-proc postExecuteVM(computation: BaseComputation, opCode: static[Op]) {.gcsafe.} =
-  when opCode == Create:
-    if computation.isSuccess:
-      let fork = computation.getFork
-      let contractFailed = not computation.writeContract(fork)
-      if contractFailed and fork >= FkHomestead:
-        computation.setError(&"writeContract failed, depth={computation.msg.depth}", true)
-
-  if computation.isSuccess:
-    computation.commit()
-  else:
-    computation.rollback()
-
-proc executeOpcodes*(computation: BaseComputation) {.gcsafe.}
-
-proc applyMessage*(computation: BaseComputation, opCode: static[Op]) =
-  if computation.msg.depth > MaxCallDepth:
-    computation.setError(&"Stack depth limit reached depth={computation.msg.depth}")
-    computation.nextProc()
-    return
-
-  computation.snapshot()
+proc execCall*(c: Computation) =
+  c.snapshot()
   defer:
-    computation.dispose()
+    c.dispose()
 
-  # EIP161 nonce incrementation
-  when opCode in {Create, Create2}:
-    if computation.getFork >= FkSpurious:
-      computation.vmState.mutateStateDb:
-        db.incNonce(computation.msg.storageAddress)
-        if computation.getFork >= FkByzantium:
-          # RevertInCreateInInit.json
-          db.setStorageRoot(computation.msg.storageAddress, emptyRlpHash)
+  if c.msg.kind == evmcCall:
+    c.vmState.mutateStateDb:
+      db.subBalance(c.msg.sender, c.msg.value)
+      db.addBalance(c.msg.contractAddress, c.msg.value)
 
-  when opCode in {CallCode, Call, Create}:
-    computation.transferBalance(opCode)
-    if computation.isError():
-      computation.rollback()
-      computation.nextProc()
-      return
+  executeOpcodes(c)
 
-  if computation.gasMeter.gasRemaining < 0:
-    computation.commit()
-    computation.nextProc()
-    return
-
-  continuation(computation):
-    postExecuteVM(computation, opCode)
-
-  executeOpcodes(computation)
-
-proc addChildComputation*(computation: BaseComputation, child: BaseComputation) =
-  if child.isError:
-    if child.msg.isCreate:
-      computation.returnData = child.output
-    elif child.shouldBurnGas:
-      computation.returnData = @[]
-    else:
-      computation.returnData = child.output
-  else:
-    if child.msg.isCreate:
-      computation.returnData = @[]
-    else:
-      computation.returnData = child.output
-    computation.logEntries.add child.logEntries
-
-  if not child.shouldBurnGas:
-    computation.gasMeter.returnGas(child.gasMeter.gasRemaining)
-  computation.children.add(child)
-
-proc registerAccountForDeletion*(c: BaseComputation, beneficiary: EthAddress) =
-  if c.msg.storageAddress in c.accountsToDelete:
-    raise newException(ValueError,
-      "invariant:  should be impossible for an account to be " &
-      "registered for deletion multiple times")
-  c.accountsToDelete[c.msg.storageAddress] = beneficiary
-
-proc addLogEntry*(c: BaseComputation, log: Log) {.inline.} =
-  c.logEntries.add(log)
-
-# many methods are basically TODO, but they still return valid values
-# in order to test some existing code
-iterator accountsForDeletion*(c: BaseComputation): EthAddress =
-  var stack = @[c]
-  var deletedAccounts = initSet[EthAddress]()
-  while stack.len > 0:
-    let comp = stack.pop()
-    if comp.isError: continue
-    for account in comp.accountsToDelete.keys:
-      if account notin deletedAccounts:
-        deletedAccounts.incl account
-        yield account
-    stack.add comp.children
-
-proc getGasRefund*(c: BaseComputation): GasInt =
-  if c.isError:
-    result = 0
-  else:
-    result = c.gasMeter.gasRefunded + c.children.mapIt(it.getGasRefund()).foldl(a + b, 0'i64)
-
-proc getGasUsed*(c: BaseComputation): GasInt =
-  if c.shouldBurnGas:
-    result = c.msg.gas
-  else:
-    result = max(0, c.msg.gas - c.gasMeter.gasRemaining)
-
-proc getGasRemaining*(c: BaseComputation): GasInt =
-  if c.shouldBurnGas:
-    result = 0
-  else:
-    result = c.gasMeter.gasRemaining
-
-proc collectTouchedAccounts*(c: BaseComputation, output: var HashSet[EthAddress]) =
-  ## Collect all of the accounts that *may* need to be deleted based on EIP161:
+  ## Collect all of the accounts that *may* need to be deleted based on EIP161
   ## https://github.com/ethereum/EIPs/blob/master/EIPS/eip-161.md
   ## also see: https://github.com/ethereum/EIPs/issues/716
 
-  proc cmpThree(address: EthAddress): bool =
-    for i in 0..18:
-      if address[i] != 0: return
-    result = address[19] == byte(3)
-
-  for _, beneficiary in c.accountsToDelete:
-    if c.isError and c.isOriginComputation:
+  if c.isError or c.fork == FKIstanbul:
+    if c.msg.contractAddress == ripemdAddr:
       # Special case to account for geth+parity bug
-      # https://github.com/ethereum/EIPs/issues/716
-      if beneficiary.cmpThree:
-        output.incl beneficiary
-      continue
-    else:
-      output.incl beneficiary
+      c.vmState.touchedAccounts.incl c.msg.contractAddress
 
-  if not c.msg.isCreate:
-    if c.isError and c.isOriginComputation:
-      # Special case to account for geth+parity bug
-      # https://github.com/ethereum/EIPs/issues/716
-      if cmpThree(c.msg.storageAddress):
-        output.incl c.msg.storageAddress
-    else:
-      output.incl c.msg.storageAddress
+  if c.isSuccess:
+    c.commit()
+    c.touchedAccounts.incl c.msg.contractAddress
+  else:
+    c.rollback()
 
-  if not c.isError:
-    for child in c.children:
-      child.collectTouchedAccounts(output)
+proc execCreate*(c: Computation) =
+  c.vmState.mutateStateDB:
+    db.incNonce(c.msg.sender)
 
-proc tracingEnabled*(c: BaseComputation): bool =
-  c.vmState.tracingEnabled
+  c.snapshot()
+  defer:
+    c.dispose()
 
-proc traceOpCodeStarted*(c: BaseComputation, op: Op): int =
+  if c.vmState.readOnlyStateDb().hasCodeOrNonce(c.msg.contractAddress):
+    c.setError("Address collision when creating contract address={c.msg.contractAddress.toHex}", true)
+    c.rollback()
+    return
+
+  c.vmState.mutateStateDb:
+    db.subBalance(c.msg.sender, c.msg.value)
+    db.addBalance(c.msg.contractAddress, c.msg.value)
+    db.clearStorage(c.msg.contractAddress)
+    if c.fork >= FkSpurious:
+      # EIP161 nonce incrementation
+      db.incNonce(c.msg.contractAddress)
+
+  executeOpcodes(c)
+
+  if c.isSuccess:
+    let fork = c.fork
+    let contractFailed = not c.writeContract(fork)
+    if contractFailed and fork >= FkHomestead:
+      c.setError(&"writeContract failed, depth={c.msg.depth}", true)
+
+  if c.isSuccess:
+    c.commit()
+  else:
+    c.rollback()
+
+proc merge*(c, child: Computation) =
+  c.logEntries.add child.logEntries
+  c.gasMeter.refundGas(child.gasMeter.gasRefunded)
+  c.suicides.incl child.suicides
+  c.touchedAccounts.incl child.touchedAccounts
+
+proc execSelfDestruct*(c: Computation, beneficiary: EthAddress) =
+  c.vmState.mutateStateDB:
+    let
+      localBalance = c.getBalance(c.msg.contractAddress)
+      beneficiaryBalance = c.getBalance(beneficiary)
+
+    # Transfer to beneficiary
+    db.setBalance(beneficiary, localBalance + beneficiaryBalance)
+
+    # Zero the balance of the address being deleted.
+    # This must come after sending to beneficiary in case the
+    # contract named itself as the beneficiary.
+    db.setBalance(c.msg.contractAddress, 0.u256)
+
+    trace "SELFDESTRUCT",
+      contractAddress = c.msg.contractAddress.toHex,
+      localBalance = localBalance.toString,
+      beneficiary = beneficiary.toHex
+
+  c.touchedAccounts.incl beneficiary
+  # Register the account to be deleted
+  c.suicides.incl(c.msg.contractAddress)
+
+proc addLogEntry*(c: Computation, log: Log) {.inline.} =
+  c.logEntries.add(log)
+
+proc getGasRefund*(c: Computation): GasInt =
+  if c.isSuccess:
+    result = c.gasMeter.gasRefunded
+
+proc refundSelfDestruct*(c: Computation) =
+  let cost = gasFees[c.fork][RefundSelfDestruct]
+  c.gasMeter.refundGas(cost * c.suicides.len)
+
+proc tracingEnabled*(c: Computation): bool {.inline.} =
+  EnableTracing in c.vmState.tracer.flags
+
+proc traceOpCodeStarted*(c: Computation, op: Op): int {.inline.} =
   c.vmState.tracer.traceOpCodeStarted(c, op)
 
-proc traceOpCodeEnded*(c: BaseComputation, op: Op, lastIndex: int) =
+proc traceOpCodeEnded*(c: Computation, op: Op, lastIndex: int) {.inline.} =
   c.vmState.tracer.traceOpCodeEnded(c, op, lastIndex)
 
-proc traceError*(c: BaseComputation) =
+proc traceError*(c: Computation) {.inline.} =
   c.vmState.tracer.traceError(c)
 
-proc prepareTracer*(c: BaseComputation) =
+proc prepareTracer*(c: Computation) {.inline.} =
   c.vmState.tracer.prepare(c.msg.depth)
 
 include interpreter_dispatch
+
+when defined(evmc_enabled):
+  include evmc_host

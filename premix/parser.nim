@@ -1,10 +1,10 @@
 import
   json, strutils, times, options, os,
   eth/[rlp, common], httputils, nimcrypto, chronicles,
-  stint, byteutils
+  stint, stew/byteutils
 
-import
-  ../nimbus/[transaction, rpc/hexstrings]
+import ../nimbus/transaction
+from ../nimbus/rpc/hexstrings import encodeQuantity
 
 func hexToInt*(s: string, T: typedesc[SomeInteger]): T =
   var i = 0
@@ -19,7 +19,7 @@ proc prefixHex*(x: Hash256): string =
   "0x" & toLowerAscii($x)
 
 proc prefixHex*(x: int64 | uint64 | byte | int): string =
-  encodeQuantity(x.uint64).toLowerAscii
+  toLowerAscii(encodeQuantity(x.uint64).string)
 
 proc prefixHex*(x: openArray[byte]): string =
   "0x" & toHex(x, true)
@@ -31,31 +31,37 @@ proc prefixHex*(x: string): string =
   "0x" & toLowerAscii(x)
 
 type
-  SomeData = EthAddress | BloomFilter | BlockNonce
+  SomeData* = EthAddress | BloomFilter | BlockNonce
 
-proc fromJson(n: JsonNode, name: string, x: var SomeData) =
+proc fromJson*(n: JsonNode, name: string, x: var SomeData) =
   hexToByteArray(n[name].getStr(), x)
-  doAssert(x.prefixHex == toLowerAscii(n[name].getStr()))
+  if x.prefixHex != toLowerAscii(n[name].getStr()):
+    debugEcho "name: ", name
+    debugEcho "A: ", x.prefixHex
+    debugEcho "B: ", toLowerAscii(n[name].getStr())
+    quit(1)
 
-proc fromJson(n: JsonNode, name: string, x: var Hash256) =
+  doAssert(x.prefixHex == toLowerAscii(n[name].getStr()), name)
+
+proc fromJson*(n: JsonNode, name: string, x: var Hash256) =
   hexToByteArray(n[name].getStr(), x.data)
-  doAssert(x.prefixHex == toLowerAscii(n[name].getStr()))
+  doAssert(x.prefixHex == toLowerAscii(n[name].getStr()), name)
 
-proc fromJson(n: JsonNode, name: string, x: var Blob) =
+proc fromJson*(n: JsonNode, name: string, x: var Blob) =
   x = hexToSeqByte(n[name].getStr())
-  doAssert(x.prefixHex == toLowerAscii(n[name].getStr()))
+  doAssert(x.prefixHex == toLowerAscii(n[name].getStr()), name)
 
-proc fromJson(n: JsonNode, name: string, x: var UInt256) =
+proc fromJson*(n: JsonNode, name: string, x: var UInt256) =
   x = UInt256.fromHex(n[name].getStr())
-  doAssert(x.prefixHex == toLowerAscii(n[name].getStr()))
+  doAssert(x.prefixHex == toLowerAscii(n[name].getStr()), name)
 
-proc fromJson(n: JsonNode, name: string, x: var SomeInteger) =
+proc fromJson*(n: JsonNode, name: string, x: var SomeInteger) =
   x = hexToInt(n[name].getStr(), type(x))
-  doAssert(x.prefixHex == toLowerAscii(n[name].getStr()))
+  doAssert(x.prefixHex == toLowerAscii(n[name].getStr()), name)
 
-proc fromJson(n: JsonNode, name: string, x: var EthTime) =
+proc fromJson*(n: JsonNode, name: string, x: var EthTime) =
   x = initTime(hexToInt(n[name].getStr(), int64), 0)
-  doAssert(x.toUnix.prefixHex == toLowerAscii(n[name].getStr()))
+  doAssert(x.toUnix.prefixHex == toLowerAscii(n[name].getStr()), name)
 
 proc parseBlockHeader*(n: JsonNode): BlockHeader =
   n.fromJson "parentHash", result.parentHash

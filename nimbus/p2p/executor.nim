@@ -1,11 +1,11 @@
 import options, sets,
-  eth/[common, bloom], ranges, chronicles, nimcrypto,
-  ../db/[db_chain, state_db],
+  eth/[common, bloom, trie/db], chronicles, nimcrypto,
+  ../db/[db_chain, accounts_cache],
   ../utils, ../constants, ../transaction,
   ../vm_state, ../vm_types, ../vm_state_transactions,
   ../vm/[computation, message],
   ../vm/interpreter/vm_forks,
-  ./dao
+  ./dao, ../config
 
 proc processTransaction*(tx: Transaction, sender: EthAddress, vmState: BaseVMState, fork: Fork): GasInt =
   ## Process the transaction, write the results to db.
@@ -13,58 +13,40 @@ proc processTransaction*(tx: Transaction, sender: EthAddress, vmState: BaseVMSta
   trace "Sender", sender
   trace "txHash", rlpHash = tx.rlpHash
 
-  if fork >= FkSpurious:
-    vmState.touchedAccounts.incl(vmState.blockHeader.coinbase)
-
-  var gasUsed = tx.gasLimit
-
-  block:
-    if vmState.cumulativeGasUsed + gasUsed > vmState.blockHeader.gasLimit:
-      debug "invalid tx: block header gasLimit reached",
-        blockGasLimit=vmState.blockHeader.gasLimit,
-        gasUsed=gasUsed,
-        txGasLimit=tx.gasLimit
-      gasUsed = 0
-      break
-
-    let upfrontGasCost = tx.gasLimit.u256 * tx.gasPrice.u256
-    var balance = vmState.readOnlyStateDb().getBalance(sender)
-    if balance < upfrontGasCost: break
-
-    let recipient = tx.getRecipient()
-    let isCollision = vmState.readOnlyStateDb().hasCodeOrNonce(recipient)
-
-    var computation = setupComputation(vmState, tx, sender, recipient, fork)
-    if computation.isNil: # OOG in setupComputation
-      gasUsed = 0
-      break
-
+  if validateTransaction(vmState, tx, sender, fork):
+    var c = setupComputation(vmState, tx, sender, fork)
     vmState.mutateStateDB:
-      db.incNonce(sender)
-      db.subBalance(sender, upfrontGasCost)
+      db.subBalance(sender, tx.gasLimit.u256 * tx.gasPrice.u256)
+    execComputation(c)
 
-    if tx.isContractCreation and isCollision: break
-    execComputation(computation)
-    if not computation.shouldBurnGas:
-      gasUsed = computation.refundGas(tx, sender)
+    result = tx.gasLimit
+    if not c.shouldBurnGas:
+      c.refundGas(tx, sender)
+      result -= c.gasMeter.gasRemaining
 
-    if computation.isSuicided(vmState.blockHeader.coinbase):
-      gasUsed = 0
+  vmState.cumulativeGasUsed += result
 
-  vmState.cumulativeGasUsed += gasUsed
+  let miner = vmState.coinbase()
 
-  # miner fee
-  let txFee = gasUsed.u256 * tx.gasPrice.u256
   vmState.mutateStateDB:
-    db.addBalance(vmState.blockHeader.coinbase, txFee)
+    # miner fee
+    let txFee = result.u256 * tx.gasPrice.u256
+    db.addBalance(miner, txFee)
 
-    # EIP158 state clearing
-    for account in vmState.touchedAccounts:
-      if db.accountExists(account) and db.isEmptyAccount(account):
-        debug "state clearing", account
-        db.deleteAccount(account)
+    for deletedAccount in vmState.suicides:
+      db.deleteAccount deletedAccount
 
-  result = gasUsed
+    if fork >= FkSpurious:
+      vmState.touchedAccounts.incl(miner)
+      # EIP158/161 state clearing
+      for account in vmState.touchedAccounts:
+        if db.accountExists(account) and db.isEmptyAccount(account):
+          debug "state clearing", account
+          db.deleteAccount(account)
+
+  if vmState.generateWitness:
+    vmState.accountDb.collectWitnessData()
+  vmState.accountDb.persist(clearCache = false)
 
 type
   # TODO: these types need to be removed
@@ -85,7 +67,7 @@ func createBloom*(receipts: openArray[Receipt]): Bloom =
     bloom.value = bloom.value or logsBloom(receipt.logs).value
   result = bloom.value.toByteArrayBE
 
-proc makeReceipt(vmState: BaseVMState, fork = FkFrontier): Receipt =
+proc makeReceipt*(vmState: BaseVMState, fork = FkFrontier): Receipt =
   if fork < FkByzantium:
     result.stateRootOrStatus = hashOrStatus(vmState.accountDb.rootHash)
   else:
@@ -102,18 +84,41 @@ const
   eth5 = 5.eth
   eth3 = 3.eth
   eth2 = 2.eth
-  blockRewards: array[Fork, Uint256] = [
+  blockRewards*: array[Fork, Uint256] = [
     eth5, # FkFrontier
-    eth5, # FkThawing
     eth5, # FkHomestead
-    eth5, # FkDao
     eth5, # FkTangerine
     eth5, # FkSpurious
     eth3, # FkByzantium
-    eth2  # FkConstantinople
+    eth2, # FkConstantinople
+    eth2, # FkPetersburg
+    eth2, # FkIstanbul
+    eth2  # FkBerlin
   ]
 
+proc calculateReward(fork: Fork, header: BlockHeader, body: BlockBody, vmState: BaseVMState) =
+  # PoA consensus engine have no reward for miner
+  if vmState.consensusEnginePoA: return
+
+  let blockReward = blockRewards[fork]
+  var mainReward = blockReward
+
+  for uncle in body.uncles:
+    var uncleReward = uncle.blockNumber.u256 + 8.u256
+    uncleReward -= header.blockNumber.u256
+    uncleReward = uncleReward * blockReward
+    uncleReward = uncleReward div 8.u256
+    vmState.mutateStateDB:
+      db.addBalance(uncle.coinbase, uncleReward)
+    mainReward += blockReward div 32.u256
+
+  vmState.mutateStateDB:
+    db.addBalance(header.coinbase, mainReward)
+
 proc processBlock*(chainDB: BaseChainDB, header: BlockHeader, body: BlockBody, vmState: BaseVMState): ValidationResult =
+  var dbTx = chainDB.db.beginTransaction()
+  defer: dbTx.dispose()
+
   if chainDB.config.daoForkSupport and header.blockNumber == chainDB.config.daoForkBlock:
     vmState.mutateStateDB:
       db.applyDAOHardFork()
@@ -122,7 +127,7 @@ proc processBlock*(chainDB: BaseChainDB, header: BlockHeader, body: BlockBody, v
     debug "Mismatched txRoot", blockNumber=header.blockNumber
     return ValidationResult.Error
 
-  let fork = vmState.blockNumber.toFork
+  let fork = chainDB.config.toFork(vmState.blockNumber)
 
   if header.txRoot != BLANK_ROOT_HASH:
     if body.transactions.len == 0:
@@ -136,35 +141,32 @@ proc processBlock*(chainDB: BaseChainDB, header: BlockHeader, body: BlockBody, v
       for txIndex, tx in body.transactions:
         var sender: EthAddress
         if tx.getSender(sender):
-          let gasUsed = processTransaction(tx, sender, vmState, fork)
+          discard processTransaction(tx, sender, vmState, fork)
         else:
           debug "Could not get sender", txIndex, tx
           return ValidationResult.Error
         vmState.receipts[txIndex] = makeReceipt(vmState, fork)
 
-  let blockReward = blockRewards[fork]
-  var mainReward = blockReward
   if header.ommersHash != EMPTY_UNCLE_HASH:
     let h = chainDB.persistUncles(body.uncles)
     if h != header.ommersHash:
       debug "Uncle hash mismatch"
       return ValidationResult.Error
-    for uncle in body.uncles:
-      var uncleReward = uncle.blockNumber + 8.u256
-      uncleReward -= header.blockNumber
-      uncleReward = uncleReward * blockReward
-      uncleReward = uncleReward div 8.u256
-      vmState.mutateStateDB:
-        db.addBalance(uncle.coinbase, uncleReward)
-      mainReward += blockReward div 32.u256
+
+  calculateReward(fork, header, body, vmState)
 
   # Reward beneficiary
   vmState.mutateStateDB:
-    db.addBalance(header.coinbase, mainReward)
+    if vmState.generateWitness:
+      db.collectWitnessData()
+    db.persist(ClearCache in vmState.flags)
 
   let stateDb = vmState.accountDb
   if header.stateRoot != stateDb.rootHash:
-    error "Wrong state root in block", blockNumber=header.blockNumber, expected=header.stateRoot, actual=stateDb.rootHash, arrivedFrom=chainDB.getCanonicalHead().stateRoot
+    when defined(geth):
+      error "Wrong state root in block", blockNumber=header.blockNumber, expected=header.stateRoot, actual=stateDb.rootHash
+    else:
+      error "Wrong state root in block", blockNumber=header.blockNumber, expected=header.stateRoot, actual=stateDb.rootHash, arrivedFrom=chainDB.getCanonicalHead().stateRoot
     # this one is a show stopper until we are confident in our VM's
     # compatibility with the main chain
     return ValidationResult.Error
@@ -178,3 +180,9 @@ proc processBlock*(chainDB: BaseChainDB, header: BlockHeader, body: BlockBody, v
   if header.receiptRoot != receiptRoot:
     debug "wrong receiptRoot in block", blockNumber=header.blockNumber, actual=receiptRoot, expected=header.receiptRoot
     return ValidationResult.Error
+
+  # `applyDeletes = false`
+  # If the trie pruning activated, each of the block will have its own state trie keep intact,
+  # rather than destroyed by trie pruning. But the current block will still get a pruned trie.
+  # If trie pruning deactivated, `applyDeletes` have no effects.
+  dbTx.commit(applyDeletes = false)

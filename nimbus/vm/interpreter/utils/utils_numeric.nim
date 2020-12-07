@@ -6,9 +6,15 @@
 # at your option. This file may not be copied, modified, or distributed except according to those terms.
 
 import
-  strformat, strutils, sequtils, endians, macros,
-  eth/common/eth_types, eth/rlp,
+  macros,
+  stew/endians2, stew/ranges/ptr_arith,
+  eth/common/eth_types,
   ../../../constants
+
+type
+  # cannot use range for unknown reason
+  # Nim bug?
+  GasNatural* = int64 # range[0'i64..high(int64)]
 
 # some methods based on py-evm utils/numeric
 
@@ -18,7 +24,7 @@ func log2*[bits: static int](value: StUint[bits]): Natural {.inline.}=
 func log256*(value: UInt256): Natural {.inline.}=
   value.log2 shr 3 # div 8 (= log2(256), Logb x = Loga x/Loga b)
 
-func ceil32*(value: Natural): Natural {.inline.}=
+func ceil32*(value: GasNatural): GasNatural {.inline.}=
   # Round input to the nearest bigger multiple of 32
 
   result = value
@@ -27,7 +33,7 @@ func ceil32*(value: Natural): Natural {.inline.}=
   if remainder != 0:
     return value + 32 - remainder
 
-func wordCount*(length: Natural): Natural {.inline.}=
+func wordCount*(length: GasNatural): GasNatural {.inline.}=
   # Returns the number of EVM words corresponding to a specific size.
   # EVM words is rounded up
   length.ceil32 shr 5 # equivalent to `div 32` (32 = 2^5)
@@ -52,7 +58,7 @@ func cleanMemRef*(x: UInt256): int {.inline.} =
   const upperBound = (high(int32) shr 2).u256
   if x > upperBound:
     return high(int32) shr 2
-  return x.toInt
+  return x.truncate(int)
 
 proc rangeToPadded*[T: StUint](x: openarray[byte], first, last: int, toLen = 0): T =
   ## Convert take a slice of a sequence of bytes interpret it as the big endian
@@ -68,7 +74,7 @@ proc rangeToPadded*[T: StUint](x: openarray[byte], first, last: int, toLen = 0):
 
   if toLen > hi-lo+1:
     var temp: array[N, byte]
-    temp[0..hi-lo] = x.toOpenArray(lo, hi)    
+    temp[0..hi-lo] = x.toOpenArray(lo, hi)
     result = T.fromBytesBE(
       temp,
       allowPadding = false
@@ -78,7 +84,7 @@ proc rangeToPadded*[T: StUint](x: openarray[byte], first, last: int, toLen = 0):
       x.toOpenArray(lo, hi),
       allowPadding = true
     )
-    
+
 proc rangeToPadded2*[T: StUint](x: openarray[byte], first, last: int, toLen = 0): T =
   ## Convert take a slice of a sequence of bytes interpret it as the big endian
   ## representation of an Uint256. Use padding for sequence shorter than 32 bytes
@@ -92,7 +98,7 @@ proc rangeToPadded2*[T: StUint](x: openarray[byte], first, last: int, toLen = 0)
     return # 0
 
   var temp: array[N, byte]
-  temp[0..hi-lo] = x.toOpenArray(lo, hi)    
+  temp[0..hi-lo] = x.toOpenArray(lo, hi)
   result = T.fromBytesBE(
     temp.toOpenArray(0, toLen-1),
     allowPadding = true
@@ -107,3 +113,9 @@ func safeInt*(x: Uint256): int {.inline.} =
   result = x.truncate(int)
   if x > high(int32).u256 or result < 0:
     result = high(int32)
+
+func toInt*(x: EthAddress): int =
+  type T = uint32
+  const len = sizeof(T)
+  fromBytesBE(T, makeOpenArray(x[x.len-len].unsafeAddr, len)).int
+  

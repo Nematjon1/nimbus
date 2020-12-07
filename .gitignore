@@ -6,10 +6,6 @@
 # Nimble packages
 /vendor/.nimble
 
-# Go packages
-/vendor/go
-!/vendor/go/src/github.com/libp2p/go-libp2p-daemon
-
 # ntags/ctags output
 /tags
 
@@ -27,4 +23,3 @@
 VMTests.md
 /debug*.json
 /block*.json
-
